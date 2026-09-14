@@ -225,7 +225,9 @@ Termination happens immediately and returns `200 OK`.
 
 ### Payload shorthand
 
-Payload shorthand is enabled by default:
+Payload shorthand follows the payload formatting rules in Temporal's
+[HTTP API proposal](https://github.com/temporalio/proposals/blob/master/api/http-api.md#payload-formatting)
+and is enabled by default:
 
 - Any JSON value is read and written as a `json/plain` Temporal payload.
 - `null` is accepted as a `binary/null` payload. Temporal's current custom
