@@ -82,7 +82,7 @@ The connector uses the client's low-level `WorkflowService` for fields the Go
 SDK's higher-level Nexus APIs do not expose. Those calls use the incoming HTTP
 request context for cancellation and deadlines and do not add the SDK's
 higher-level automatic retries. Clients that retry start, cancel, or terminate
-requests should reuse the same `requestId`.
+requests should reuse the same `Request-Id` header value.
 
 Request bodies are limited to 4 MiB by default. Set `MaxRequestBodySize` to an
 `nexushttp.MaxRequestBodySize` byte count to override the limit; zero rejects
@@ -194,15 +194,17 @@ and unknown fields are rejected.
 The start body is a
 `temporal.api.workflowservice.v1.StartNexusOperationExecutionRequest`.
 `operationId` comes from the route and the namespace comes from the configured
-client options, so callers should omit both from the body. A caller-provided
-`requestId` is forwarded unchanged; when it is omitted, the connector generates
-one. Search attributes, Nexus headers, and both user-metadata fields are
-forwarded. The request `identity` is also forwarded when present; when omitted,
+client options, so callers should omit both from the body. The connector reads
+the Temporal request ID from the `Request-Id` header and generates one when the
+header is omitted. A `requestId` field in the body is ignored. Search
+attributes, Nexus headers, and both user-metadata fields are forwarded. The
+request `identity` is also forwarded when present; when omitted,
 it falls back to `ClientOptions.Identity` and stays empty if that is unset:
 
 ```http
 POST /operations/my-op-1
 Content-Type: application/json
+Request-Id: start-request-1
 
 {
   "endpoint": "myEndpoint",
@@ -218,8 +220,9 @@ Start always returns `201 Created` with a
 containing only the operation run ID. The `started` field is intentionally not
 populated, even when Temporal reports that a new operation was started.
 Describe, poll, list, count, cancel, and terminate return their generated
-WorkflowService response messages. Caller-provided cancellation and termination
-`requestId` values are also forwarded unchanged; omitted values are generated.
+WorkflowService response messages. Cancellation and termination also read their
+Temporal request IDs from `Request-Id`; omitted values are generated, and body
+`requestId` fields are ignored.
 Cancellation returns `202 Accepted` because it is eventually consistent.
 Termination happens immediately and returns `200 OK`.
 

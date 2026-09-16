@@ -179,6 +179,14 @@ func newHandler(service workflowservice.WorkflowServiceClient, clientOptions cli
 	}
 }
 
+func requestIDFromHeader(r *http.Request) string {
+	requestID := r.Header.Get("Request-Id")
+	if requestID == "" {
+		return uuid.NewString()
+	}
+	return requestID
+}
+
 func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 	query := newRequestQuery(r)
 	request := &workflowservice.StartNexusOperationExecutionRequest{}
@@ -198,9 +206,7 @@ func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 	}
 	request.Namespace = h.namespace
 	request.Identity = cmp.Or(request.Identity, h.identity)
-	if request.RequestId == "" {
-		request.RequestId = uuid.NewString()
-	}
+	request.RequestId = requestIDFromHeader(r)
 	response, err := h.service.StartNexusOperationExecution(r.Context(), request)
 	if err != nil {
 		h.writeError(w, err)
@@ -388,9 +394,7 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	request.OperationId = r.PathValue("id")
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
-	if request.RequestId == "" {
-		request.RequestId = uuid.NewString()
-	}
+	request.RequestId = requestIDFromHeader(r)
 	if err := h.encodeOutbound(r.Context(), request); err != nil {
 		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
 		return
@@ -422,9 +426,7 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 	request.OperationId = r.PathValue("id")
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
-	if request.RequestId == "" {
-		request.RequestId = uuid.NewString()
-	}
+	request.RequestId = requestIDFromHeader(r)
 	if err := h.encodeOutbound(r.Context(), request); err != nil {
 		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
 		return

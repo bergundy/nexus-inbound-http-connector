@@ -177,7 +177,7 @@ func TestStartOperationProtoJSON(t *testing.T) {
 	h := newTestHandler(t, service, Options{ClientOptions: &client.Options{Namespace: "configured-namespace"}})
 
 	body := `{
-		"requestId":"fixed-start-request",
+		"requestId":"body-start-request",
 		"endpoint":"payments",
 		"service":"charge",
 		"operation":"authorize",
@@ -191,7 +191,11 @@ func TestStartOperationProtoJSON(t *testing.T) {
 		"nexusHeader":{"trace-id":"trace-1"},
 		"userMetadata":{"summary":"card authorization","details":{"card":"ending 42"}}
 	}`
-	response := serve(h, http.MethodPost, "/operations/op%20%2F%20ID", body)
+	httpRequest := httptest.NewRequest(http.MethodPost, "/operations/op%20%2F%20ID", bytes.NewBufferString(body))
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Request-Id", "fixed-start-request")
+	response := httptest.NewRecorder()
+	h.ServeHTTP(response, httpRequest)
 	requireStatus(t, http.StatusCreated, response)
 	require.NotNil(t, gotRequest, "StartNexusOperationExecution was not called")
 
@@ -388,22 +392,29 @@ func TestReadAndActionRoutesUseProtoResponses(t *testing.T) {
 	h := newTestHandler(t, service, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
 
 	tests := []struct {
-		method string
-		path   string
-		body   string
-		status int
-		fields []string
+		method    string
+		path      string
+		body      string
+		requestID string
+		status    int
+		fields    []string
 	}{
-		{http.MethodGet, "/operations/op-1?runId=run-1&includeInput=true&includeOutcome=true&longPollToken=AQID", "", http.StatusOK, []string{`"operationId":"op-1"`, `"input":{"input":1}`, `"result":"done"`, `"longPollToken":"BAUG"`}},
-		{http.MethodGet, "/operations/op-1/poll?runId=run-1&waitStage=Started", "", http.StatusOK, []string{`"waitStage":"NEXUS_OPERATION_WAIT_STAGE_CLOSED"`, `"operationToken":"operation-token"`, `"result":"done"`}},
-		{http.MethodGet, "/operations?query=ExecutionStatus%3D%27Running%27&pageSize=25&nextPageToken=AQID", "", http.StatusOK, []string{`"operations":[`, `"nextPageToken":"BwgJ"`}},
-		{http.MethodGet, "/operation-count?query=GROUP+BY+ExecutionStatus", "", http.StatusOK, []string{`"count":"2"`, `"groupValues":["Running"]`}},
-		{http.MethodPost, "/operations/op-1/cancel?runId=run-1", `{"reason":"stop","requestId":"fixed-cancel-request"}`, http.StatusAccepted, []string{`{}`}},
-		{http.MethodPost, "/operations/op-1/terminate?runId=run-1", `{"reason":"kill","requestId":"fixed-terminate-request"}`, http.StatusOK, []string{`{}`}},
+		{http.MethodGet, "/operations/op-1?runId=run-1&includeInput=true&includeOutcome=true&longPollToken=AQID", "", "", http.StatusOK, []string{`"operationId":"op-1"`, `"input":{"input":1}`, `"result":"done"`, `"longPollToken":"BAUG"`}},
+		{http.MethodGet, "/operations/op-1/poll?runId=run-1&waitStage=Started", "", "", http.StatusOK, []string{`"waitStage":"NEXUS_OPERATION_WAIT_STAGE_CLOSED"`, `"operationToken":"operation-token"`, `"result":"done"`}},
+		{http.MethodGet, "/operations?query=ExecutionStatus%3D%27Running%27&pageSize=25&nextPageToken=AQID", "", "", http.StatusOK, []string{`"operations":[`, `"nextPageToken":"BwgJ"`}},
+		{http.MethodGet, "/operation-count?query=GROUP+BY+ExecutionStatus", "", "", http.StatusOK, []string{`"count":"2"`, `"groupValues":["Running"]`}},
+		{http.MethodPost, "/operations/op-1/cancel?runId=run-1", `{"reason":"stop","requestId":"body-cancel-request"}`, "fixed-cancel-request", http.StatusAccepted, []string{`{}`}},
+		{http.MethodPost, "/operations/op-1/terminate?runId=run-1", `{"reason":"kill","requestId":"body-terminate-request"}`, "fixed-terminate-request", http.StatusOK, []string{`{}`}},
 	}
 	for _, test := range tests {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
-			response := serve(h, test.method, test.path, test.body)
+			request := httptest.NewRequest(test.method, test.path, bytes.NewBufferString(test.body))
+			request.Header.Set("Content-Type", "application/json")
+			if test.requestID != "" {
+				request.Header.Set("Request-Id", test.requestID)
+			}
+			response := httptest.NewRecorder()
+			h.ServeHTTP(response, request)
 			requireStatus(t, test.status, response)
 			for _, field := range test.fields {
 				require.Contains(t, response.Body.String(), field)
