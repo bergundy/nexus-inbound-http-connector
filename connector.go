@@ -214,6 +214,10 @@ func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 }
 
 func validateStartRequest(request *workflowservice.StartNexusOperationExecutionRequest) error {
+	if request.Namespace != "" {
+		return newStatusErrorf(http.StatusBadRequest, "namespace must not be provided")
+	}
+	// TODO: block links and completion callbacks once the API is updated.
 	if request.Endpoint == "" || request.Service == "" || request.Operation == "" {
 		return newStatusErrorf(http.StatusBadRequest, "endpoint, service, and operation are required")
 	}
@@ -376,6 +380,10 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
+	if request.Namespace != "" {
+		h.writeError(w, newStatusErrorf(http.StatusBadRequest, "namespace must not be provided"))
+		return
+	}
 	request.Namespace = h.namespace
 	request.OperationId = r.PathValue("id")
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
@@ -404,6 +412,10 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 	request := &workflowservice.TerminateNexusOperationExecutionRequest{}
 	if err := decodeProtoBody(r.Body, query, request, true); err != nil {
 		h.writeError(w, err)
+		return
+	}
+	if request.Namespace != "" {
+		h.writeError(w, newStatusErrorf(http.StatusBadRequest, "namespace must not be provided"))
 		return
 	}
 	request.Namespace = h.namespace

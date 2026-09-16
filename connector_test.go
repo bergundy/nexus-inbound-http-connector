@@ -177,7 +177,6 @@ func TestStartOperationProtoJSON(t *testing.T) {
 	h := newTestHandler(t, service, Options{ClientOptions: &client.Options{Namespace: "configured-namespace"}})
 
 	body := `{
-		"namespace":"caller-namespace",
 		"requestId":"fixed-start-request",
 		"endpoint":"payments",
 		"service":"charge",
@@ -196,7 +195,7 @@ func TestStartOperationProtoJSON(t *testing.T) {
 	requireStatus(t, http.StatusCreated, response)
 	require.NotNil(t, gotRequest, "StartNexusOperationExecution was not called")
 
-	// The configured namespace wins over the caller's, and the operation ID
+	// The configured namespace is added by the connector, and the operation ID
 	// comes from the percent-decoded path.
 	require.Equal(t, "configured-namespace", gotRequest.Namespace)
 	require.Equal(t, "fixed-start-request", gotRequest.RequestId)
@@ -479,6 +478,45 @@ func TestInvalidRequestsAreBadRequests(t *testing.T) {
 			response := serve(h, test.method, test.path, body)
 			requireStatus(t, http.StatusBadRequest, response)
 			require.NotEmpty(t, requireLoneMessage(t, response.Body.Bytes()))
+		})
+	}
+}
+
+func TestNamespaceCannotBeProvided(t *testing.T) {
+	t.Parallel()
+
+	called := false
+	service := &fakeWorkflowService{
+		start: func(context.Context, *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+			called = true
+			return &workflowservice.StartNexusOperationExecutionResponse{}, nil
+		},
+		cancel: func(context.Context, *workflowservice.RequestCancelNexusOperationExecutionRequest) (*workflowservice.RequestCancelNexusOperationExecutionResponse, error) {
+			called = true
+			return &workflowservice.RequestCancelNexusOperationExecutionResponse{}, nil
+		},
+		terminate: func(context.Context, *workflowservice.TerminateNexusOperationExecutionRequest) (*workflowservice.TerminateNexusOperationExecutionResponse, error) {
+			called = true
+			return &workflowservice.TerminateNexusOperationExecutionResponse{}, nil
+		},
+	}
+	h := newTestHandler(t, service, Options{})
+	tests := []struct {
+		name string
+		path string
+		body string
+	}{
+		{"start", "/operations/op", `{"namespace":"caller-namespace","endpoint":"e","service":"s","operation":"o"}`},
+		{"cancel", "/operations/op/cancel", `{"namespace":"caller-namespace"}`},
+		{"terminate", "/operations/op/terminate", `{"namespace":"caller-namespace"}`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called = false
+			response := serve(h, http.MethodPost, test.path, test.body)
+			requireStatus(t, http.StatusBadRequest, response)
+			require.Equal(t, "namespace must not be provided", requireLoneMessage(t, response.Body.Bytes()))
+			require.False(t, called, "WorkflowService must not be called")
 		})
 	}
 }
