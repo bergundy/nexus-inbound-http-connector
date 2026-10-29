@@ -6,12 +6,14 @@ client options, wrap the handler in their own authentication and authorization
 middleware, and deploy it with their existing HTTP server.
 
 The connector is stateless and does not own a server or introduce a new
-Temporal-side ingress path. It does dial its own Temporal connection from the
-supplied `client.Options`, which control the address, TLS configuration,
-credentials, and the namespace written to every Temporal request. When no
-options are supplied, they are loaded from
+Temporal-side ingress path. By default it dials its own Temporal connection
+from the supplied `client.Options`, which control the address, TLS
+configuration, credentials, and the namespace written to every Temporal
+request. When no options are supplied, they are loaded from
 [Temporal environment configuration](#client-configuration). The handler owns
-that connection, so close it when the process shuts down.
+that connection, so close it when the process shuts down. An application that
+already holds a connection can
+[pass it in instead](#using-an-existing-connection).
 
 ## Requirements
 
@@ -91,6 +93,10 @@ non-empty request bodies. Set it to
 
 ## Client configuration
 
+This section describes the default, where `NewHandler` dials its own
+connection; see [Using an existing connection](#using-an-existing-connection)
+for the alternative.
+
 `Options.ClientOptions` is a `*client.Options`. Leave it nil—the default—and
 `NewHandler` loads the options with
 [`envconfig.LoadDefaultClientOptions`](https://pkg.go.dev/go.temporal.io/sdk/contrib/envconfig),
@@ -125,8 +131,9 @@ clientOptions.Identity = "nexus-http-connector"
 handler, err := nexushttp.NewHandler(ctx, nexushttp.Options{ClientOptions: &clientOptions})
 ```
 
-The connector calls Temporal through the client's low-level `WorkflowService`,
-so only part of `client.Options` reaches its requests:
+When it dials, the connector calls Temporal through the client's low-level
+`WorkflowService`, so only part of `client.Options` reaches its requests. With
+`Options.WorkflowService`, only `Namespace` and `Identity` apply:
 
 | Field | How the connector uses it |
 | --- | --- |
@@ -145,12 +152,40 @@ the worker-only `WorkerHeartbeatInterval`, `SdkName`, and `SdkVersion`.
 reason: they configure a remote data converter. Use
 [`PayloadCodecs`](#payload-codecs) for payload encoding.
 
+### Using an existing connection
+
+An application that already holds a `WorkflowService` connection, such as a
+gateway with its own routing, credentials, or interceptors, can set
+`Options.WorkflowService` to serve the API over it instead of dialing a second
+one:
+
+```go
+handler, err := nexushttp.NewHandler(ctx, nexushttp.Options{
+	WorkflowService: temporalClient.WorkflowService(),
+	ClientOptions: &client.Options{
+		Namespace: "my-namespace",
+		Identity:  "nexus-http-connector",
+	},
+})
+```
+
+`NewHandler` then dials nothing and loads no environment configuration, and
+`Handler.Close` does nothing: the caller owns the connection, including its
+address, TLS, credentials, and lifecycle. Of `ClientOptions` it reads only
+`Namespace` and `Identity`. `Namespace` is required, since there is no dialed
+client whose default to follow, and `Identity` is left empty when unset.
+Setting any field that only configures a dialed connection—`HostPort`,
+`Credentials`, `ConnectionOptions`, `HeadersProvider`, `Logger`,
+`MetricsHandler`, `DisableErrorCodeMetricTags`, or `Plugins`—makes `NewHandler`
+return an error rather than silently ignoring it.
+
 ## Connector namespace
 
 A Standalone Nexus Operation has no calling Workflow, so Temporal needs a
 namespace to own it. That namespace is `ClientOptions.Namespace`, which the
-connector writes to every request to the server. A single `nexushttp.Handler`
-connects to a single connector namespace.
+connector writes to every request to the server, whether it dials its own
+connection or uses one passed in. A single `nexushttp.Handler` connects to a
+single connector namespace.
 
 It is the caller side of an operation, not the handler side. The `endpoint` in
 a start body names a Nexus Endpoint that routes to a handler in its own target
@@ -285,13 +320,16 @@ The connector intentionally does not provide HTTP authentication,
 authorization, rate limiting, TLS termination, or policy middleware. The host
 application owns those concerns. Temporal authentication and TLS come from the
 supplied or environment-loaded client options—`Credentials`, `ConnectionOptions`,
-and `HeadersProvider`. Configured payload codecs protect operation input before it
-leaves the application environment and decode operation results and failures
+and `HeadersProvider`—or, with `Options.WorkflowService`, from the connection the
+application passes in. Configured payload codecs protect operation input before
+it leaves the application environment and decode operation results and failures
 after they return.
 
-Every request the handler serves carries the same Temporal credentials and the
-same [connector namespace](#connector-namespace), so Temporal cannot tell one
-HTTP caller from another. Its
+Every request the handler serves carries the same
+[connector namespace](#connector-namespace), and, on a connection the connector
+dials, the same Temporal credentials, so Temporal cannot tell one HTTP caller
+from another. A connection passed in carries whatever credentials the
+application attaches to it. Its
 [endpoint permissions](#endpoint-permissions) bound what any caller can reach;
 middleware decides which callers get that far.
 

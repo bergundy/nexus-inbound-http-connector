@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -26,6 +27,7 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/converter"
+	"go.temporal.io/sdk/log"
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -119,6 +121,130 @@ func TestIdentityIsNotSynthesized(t *testing.T) {
 	serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`)
 	require.Empty(t, gotStart.Identity)
 }
+
+// TestNewHandlerUsesSuppliedWorkflowService pins that a supplied WorkflowService
+// is used instead of dialing: NewHandler succeeds with an already-canceled
+// context, which a dial would fail on, requests carry ClientOptions' namespace
+// and identity, and the other options still apply.
+func TestNewHandlerUsesSuppliedWorkflowService(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var gotStart *workflowservice.StartNexusOperationExecutionRequest
+	codec := &prefixCodec{}
+	h, err := NewHandler(ctx, Options{
+		ClientOptions: &client.Options{Namespace: "embedded-namespace", Identity: "embedded-identity"},
+		WorkflowService: &fakeWorkflowService{
+			start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+				gotStart = request
+				return &workflowservice.StartNexusOperationExecutionResponse{}, nil
+			},
+		},
+		PayloadCodecs: []converter.PayloadCodec{codec},
+	})
+	require.NoError(t, err)
+
+	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"hello":"world"}}`)
+	requireStatus(t, http.StatusCreated, response)
+	require.Equal(t, "embedded-namespace", gotStart.Namespace)
+	require.Equal(t, "embedded-identity", gotStart.Identity)
+	require.Equal(t, 1, codec.encoded)
+
+	// Close must not panic when nothing was dialed.
+	h.Close()
+}
+
+// TestSuppliedWorkflowServiceLeavesIdentityEmpty pins that an unset identity
+// stays unset with a supplied WorkflowService, as it does when dialing.
+func TestSuppliedWorkflowServiceLeavesIdentityEmpty(t *testing.T) {
+	t.Parallel()
+	var gotStart *workflowservice.StartNexusOperationExecutionRequest
+	h, err := NewHandler(t.Context(), Options{
+		ClientOptions: &client.Options{Namespace: "embedded-namespace"},
+		WorkflowService: &fakeWorkflowService{
+			start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+				gotStart = request
+				return &workflowservice.StartNexusOperationExecutionResponse{}, nil
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	requireStatus(t, http.StatusCreated, serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`))
+	require.Empty(t, gotStart.Identity)
+}
+
+// TestSuppliedWorkflowServiceSkipsEnvironment pins that NewHandler reads no
+// Temporal environment configuration when given a WorkflowService: the config
+// file it would read is invalid, so any attempt to load it would fail.
+func TestSuppliedWorkflowServiceSkipsEnvironment(t *testing.T) {
+	configFile := filepath.Join(t.TempDir(), "temporal.toml")
+	require.NoError(t, os.WriteFile(configFile, []byte("not [valid toml"), 0o600))
+	t.Setenv("TEMPORAL_CONFIG_FILE", configFile)
+	t.Setenv("TEMPORAL_NAMESPACE", "env-namespace")
+
+	var gotRequest *workflowservice.CountNexusOperationExecutionsRequest
+	h, err := NewHandler(t.Context(), Options{
+		ClientOptions: &client.Options{Namespace: "embedded-namespace"},
+		WorkflowService: &fakeWorkflowService{
+			count: func(_ context.Context, request *workflowservice.CountNexusOperationExecutionsRequest) (*workflowservice.CountNexusOperationExecutionsResponse, error) {
+				gotRequest = request
+				return &workflowservice.CountNexusOperationExecutionsResponse{}, nil
+			},
+		},
+	})
+	require.NoError(t, err)
+
+	requireStatus(t, http.StatusOK, serve(h, http.MethodGet, "/operation-count", ""))
+	require.Equal(t, "embedded-namespace", gotRequest.Namespace)
+}
+
+// TestSuppliedWorkflowServiceRequiresNamespace pins that a supplied
+// WorkflowService needs an explicit namespace: there is no dialed client whose
+// default it could follow.
+func TestSuppliedWorkflowServiceRequiresNamespace(t *testing.T) {
+	t.Parallel()
+	for name, clientOptions := range map[string]*client.Options{
+		"nil client options": nil,
+		"empty namespace":    {Identity: "embedded-identity"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewHandler(t.Context(), Options{ClientOptions: clientOptions, WorkflowService: &fakeWorkflowService{}})
+			require.EqualError(t, err, "ClientOptions.Namespace is required when WorkflowService is set")
+		})
+	}
+}
+
+// TestSuppliedWorkflowServiceRejectsDialOptions pins that the ClientOptions
+// fields that only configure a dialed connection cannot be combined with a
+// supplied WorkflowService, rather than being silently ignored.
+func TestSuppliedWorkflowServiceRejectsDialOptions(t *testing.T) {
+	t.Parallel()
+	tests := map[string]client.Options{
+		"HostPort":                   {HostPort: "temporal.example.com:7233"},
+		"Credentials":                {Credentials: client.NewAPIKeyStaticCredentials("key")},
+		"ConnectionOptions":          {ConnectionOptions: client.ConnectionOptions{Authority: "temporal.example.com"}},
+		"HeadersProvider":            {HeadersProvider: headersProvider{}},
+		"Logger":                     {Logger: log.NewStructuredLogger(slog.New(slog.DiscardHandler))},
+		"MetricsHandler":             {MetricsHandler: client.MetricsNopHandler},
+		"DisableErrorCodeMetricTags": {DisableErrorCodeMetricTags: true},
+		"Plugins":                    {Plugins: []client.Plugin{nil}},
+	}
+	for field, clientOptions := range tests {
+		t.Run(field, func(t *testing.T) {
+			t.Parallel()
+			clientOptions.Namespace = "embedded-namespace"
+			_, err := NewHandler(t.Context(), Options{ClientOptions: &clientOptions, WorkflowService: &fakeWorkflowService{}})
+			require.EqualError(t, err, "ClientOptions."+field+" configures a dialed connection and cannot be set with WorkflowService")
+		})
+	}
+}
+
+type headersProvider struct{}
+
+func (headersProvider) GetHeaders(context.Context) (map[string]string, error) { return nil, nil }
 
 func TestMaxRequestBodySize(t *testing.T) {
 	t.Parallel()
