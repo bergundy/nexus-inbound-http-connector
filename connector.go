@@ -12,7 +12,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"reflect"
 
 	"github.com/google/uuid"
 	"go.temporal.io/api/temporalproto"
@@ -43,12 +42,51 @@ func (MaxRequestBodySizeNotEnforced) requestBodySizeLimit() {}
 
 // Options configures a Nexus HTTP handler.
 type Options struct {
-	// ClientOptions configures the Temporal client [NewHandler] dials. When it
+	// Connection selects how the handler reaches Temporal: a client
+	// [NewHandler] dials from client options, with
+	// [ConnectionOptionsFromClientOptions], or a WorkflowService client the
+	// caller already holds, with [ConnectionOptionsFromWorkflowServiceClient].
+	// It defaults to ConnectionOptionsFromClientOptions{}, which dials from
+	// Temporal environment configuration.
+	Connection ConnectionOptions
+
+	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
+	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
+	// MaxRequestBodySize of zero rejects non-empty request bodies.
+	MaxRequestBodySize RequestBodySizeLimit
+
+	// Logger records internal server errors, each under a generated ID that is
+	// also the only detail the caller receives. It defaults to slog.Default().
+	Logger *slog.Logger
+}
+
+// ConnectionOptions is a closed set of ways for the handler to reach Temporal:
+// [ConnectionOptionsFromClientOptions] and
+// [ConnectionOptionsFromWorkflowServiceClient].
+type ConnectionOptions interface {
+	// connect returns the connection the handler serves requests over. ctx
+	// bounds any connection attempt only.
+	connect(ctx context.Context) (connection, error)
+}
+
+// connection is what the handler needs from Temporal, however it was reached.
+type connection struct {
+	service   workflowservice.WorkflowServiceClient
+	namespace string
+	identity  string
+	codecs    []converter.PayloadCodec
+	// close shuts down a connection NewHandler dialed, and is nil when the
+	// caller owns the connection.
+	close func()
+}
+
+// ConnectionOptionsFromClientOptions makes [NewHandler] dial its own Temporal
+// client, which [Handler.Close] closes.
+type ConnectionOptionsFromClientOptions struct {
+	// ClientOptions configures the Temporal client NewHandler dials. When it
 	// is nil, NewHandler loads the options from Temporal environment
 	// configuration with [envconfig.LoadDefaultClientOptions]: the TEMPORAL_*
 	// environment variables layered over the temporal.toml profile they select.
-	// When WorkflowService is set, nothing is dialed or loaded; see
-	// WorkflowService for the fields read then.
 	//
 	// The connector calls Temporal through the client's low-level
 	// WorkflowService, so only part of this struct reaches its requests:
@@ -78,32 +116,83 @@ type Options struct {
 	// configures a remote data converter.
 	ClientOptions *client.Options
 
-	// WorkflowService, when set, is used for every Temporal call in place of a
-	// connection NewHandler would dial. It must be non-nil and ready to use.
-	// The caller owns it, including its address, TLS, credentials, and
-	// lifecycle.
-	//
-	// NewHandler then dials nothing and loads no environment configuration.
-	// It reads only Namespace, which is required, and Identity from
-	// ClientOptions, and returns an error if any field that only configures a
-	// dialed connection is set: HostPort, Credentials, ConnectionOptions,
-	// HeadersProvider, Logger, MetricsHandler, DisableErrorCodeMetricTags, or
-	// Plugins.
-	WorkflowService workflowservice.WorkflowServiceClient
-
 	// PayloadCodecs are applied by the connector when reading and writing
 	// operation input, result, and failure payloads. Direct WorkflowService
 	// calls bypass the client's data converter.
 	PayloadCodecs []converter.PayloadCodec
+}
 
-	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
-	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
-	// MaxRequestBodySize of zero rejects non-empty request bodies.
-	MaxRequestBodySize RequestBodySizeLimit
+func (o ConnectionOptionsFromClientOptions) connect(ctx context.Context) (connection, error) {
+	clientOptions, err := o.resolveClientOptions()
+	if err != nil {
+		return connection{}, err
+	}
+	temporalClient, err := client.DialContext(ctx, clientOptions)
+	if err != nil {
+		return connection{}, fmt.Errorf("dial Temporal: %w", err)
+	}
+	// The SDK client is not retained: the connector only needs the
+	// WorkflowService stub bound to its connection, and its Close.
+	c := o.connection(temporalClient.WorkflowService(), clientOptions)
+	c.close = temporalClient.Close
+	return c, nil
+}
 
-	// Logger records internal server errors, each under a generated ID that is
-	// also the only detail the caller receives. It defaults to slog.Default().
-	Logger *slog.Logger
+// resolveClientOptions returns the client options to dial with, loading them
+// from Temporal environment configuration when the caller supplied none.
+func (o ConnectionOptionsFromClientOptions) resolveClientOptions() (client.Options, error) {
+	if o.ClientOptions != nil {
+		return *o.ClientOptions, nil
+	}
+	clientOptions, err := envconfig.LoadDefaultClientOptions()
+	if err != nil {
+		return client.Options{}, fmt.Errorf("load Temporal environment configuration: %w", err)
+	}
+	return clientOptions, nil
+}
+
+// connection describes service, bound to a client dialed from clientOptions.
+func (o ConnectionOptionsFromClientOptions) connection(service workflowservice.WorkflowServiceClient, clientOptions client.Options) connection {
+	return connection{
+		service:   service,
+		namespace: cmp.Or(clientOptions.Namespace, client.DefaultNamespace),
+		identity:  clientOptions.Identity,
+		codecs:    append([]converter.PayloadCodec(nil), o.PayloadCodecs...),
+	}
+}
+
+// ConnectionOptionsFromWorkflowServiceClient makes [NewHandler] serve the API
+// over a WorkflowService client the caller already holds, such as one with its
+// own routing, credentials, or interceptors, instead of dialing a second
+// connection. NewHandler dials nothing and loads no environment configuration,
+// and [Handler.Close] does nothing: the caller owns the client, including its
+// address, TLS, credentials, and lifecycle.
+type ConnectionOptionsFromWorkflowServiceClient struct {
+	// WorkflowServiceClient is used for every Temporal call. It is required
+	// and must be ready to use.
+	WorkflowServiceClient workflowservice.WorkflowServiceClient
+
+	// Identity is written to start, cancel, and terminate requests whose body
+	// omits an identity. It is left unset when empty.
+	Identity string
+
+	// Namespace is written to every WorkflowService request. It is required:
+	// there is no dialed client whose default it could follow.
+	Namespace string
+}
+
+func (o ConnectionOptionsFromWorkflowServiceClient) connect(context.Context) (connection, error) {
+	if o.WorkflowServiceClient == nil {
+		return connection{}, errors.New("ConnectionOptionsFromWorkflowServiceClient.WorkflowServiceClient is required")
+	}
+	if o.Namespace == "" {
+		return connection{}, errors.New("ConnectionOptionsFromWorkflowServiceClient.Namespace is required")
+	}
+	return connection{
+		service:   o.WorkflowServiceClient,
+		namespace: o.Namespace,
+		identity:  o.Identity,
+	}, nil
 }
 
 type handler struct {
@@ -119,37 +208,26 @@ type handler struct {
 // connection.
 type Handler struct {
 	mux http.Handler
-	// close shuts down the dialed connection, and is nil when the caller
-	// supplied Options.WorkflowService. The SDK client it came from is not
-	// retained: the connector only needs the WorkflowService stub bound to
-	// that connection, which it captured in mux.
+	// close shuts down the dialed connection, and is nil when nothing was
+	// dialed.
 	close func()
 }
 
-// NewHandler returns a handler for the complete Standalone Nexus Operation API.
-// Unless options.WorkflowService is set, it dials Temporal; ctx bounds that
-// connection attempt only and is otherwise unused, and served requests use
-// their own contexts. Call [Handler.Close] when done with the handler to
-// release the connection it dialed, if any.
+// NewHandler returns a handler for the complete Standalone Nexus Operation API,
+// reaching Temporal as options.Connection selects. When that dials Temporal,
+// ctx bounds the connection attempt only; served requests use their own
+// contexts. Call [Handler.Close] when done with the handler to release the
+// connection it dialed, if any.
 func NewHandler(ctx context.Context, options Options) (*Handler, error) {
-	if options.WorkflowService != nil {
-		if err := checkSuppliedServiceOptions(options.ClientOptions); err != nil {
-			return nil, err
-		}
-		return &Handler{mux: newHandler(options.WorkflowService, *options.ClientOptions, options)}, nil
+	connectionOptions := options.Connection
+	if connectionOptions == nil {
+		connectionOptions = ConnectionOptionsFromClientOptions{}
 	}
-	clientOptions, err := resolveClientOptions(options)
+	c, err := connectionOptions.connect(ctx)
 	if err != nil {
 		return nil, err
 	}
-	temporalClient, err := client.DialContext(ctx, clientOptions)
-	if err != nil {
-		return nil, fmt.Errorf("dial Temporal: %w", err)
-	}
-	return &Handler{
-		mux:   newHandler(temporalClient.WorkflowService(), clientOptions, options),
-		close: temporalClient.Close,
-	}, nil
+	return &Handler{mux: newHandler(c, options), close: c.close}, nil
 }
 
 // ServeHTTP implements [http.Handler].
@@ -166,55 +244,14 @@ func (h *Handler) Close() {
 	}
 }
 
-// checkSuppliedServiceOptions reports why clientOptions cannot accompany a
-// supplied WorkflowService: it names no namespace, which a dialed client would
-// otherwise default, or it sets a field that only configures a dialed
-// connection, which would otherwise be silently ignored.
-func checkSuppliedServiceOptions(clientOptions *client.Options) error {
-	if clientOptions == nil || clientOptions.Namespace == "" {
-		return errors.New("ClientOptions.Namespace is required when WorkflowService is set")
-	}
-	for _, field := range []struct {
-		name string
-		set  bool
-	}{
-		{"HostPort", clientOptions.HostPort != ""},
-		{"Credentials", clientOptions.Credentials != nil},
-		{"ConnectionOptions", !reflect.ValueOf(clientOptions.ConnectionOptions).IsZero()},
-		{"HeadersProvider", clientOptions.HeadersProvider != nil},
-		{"Logger", clientOptions.Logger != nil},
-		{"MetricsHandler", clientOptions.MetricsHandler != nil},
-		{"DisableErrorCodeMetricTags", clientOptions.DisableErrorCodeMetricTags},
-		{"Plugins", len(clientOptions.Plugins) > 0},
-	} {
-		if field.set {
-			return fmt.Errorf("ClientOptions.%s configures a dialed connection and cannot be set with WorkflowService", field.name)
-		}
-	}
-	return nil
-}
-
-// resolveClientOptions returns the client options to dial with, loading them
-// from Temporal environment configuration when the caller supplied none.
-func resolveClientOptions(options Options) (client.Options, error) {
-	if options.ClientOptions != nil {
-		return *options.ClientOptions, nil
-	}
-	clientOptions, err := envconfig.LoadDefaultClientOptions()
-	if err != nil {
-		return client.Options{}, fmt.Errorf("load Temporal environment configuration: %w", err)
-	}
-	return clientOptions, nil
-}
-
-// newHandler builds the routed HTTP handler around an already-connected
-// WorkflowService client.
-func newHandler(service workflowservice.WorkflowServiceClient, clientOptions client.Options, options Options) http.Handler {
+// newHandler builds the routed HTTP handler around an already-established
+// connection.
+func newHandler(c connection, options Options) http.Handler {
 	h := &handler{
-		service:   service,
-		namespace: cmp.Or(clientOptions.Namespace, client.DefaultNamespace),
-		identity:  clientOptions.Identity,
-		codecs:    append([]converter.PayloadCodec(nil), options.PayloadCodecs...),
+		service:   c.service,
+		namespace: c.namespace,
+		identity:  c.identity,
+		codecs:    c.codecs,
 		logger:    cmp.Or(options.Logger, slog.Default()),
 	}
 	mux := http.NewServeMux()
