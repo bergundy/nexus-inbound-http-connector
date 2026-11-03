@@ -162,6 +162,33 @@ func TestNewHandlerUsesSuppliedWorkflowServiceClient(t *testing.T) {
 	h.Close()
 }
 
+// TestSuppliedWorkflowServiceClientAppliesPayloadCodecs pins that payload codecs
+// apply the same way with a supplied WorkflowService client as with a dialed
+// one.
+func TestSuppliedWorkflowServiceClientAppliesPayloadCodecs(t *testing.T) {
+	t.Parallel()
+
+	codec := &prefixCodec{}
+	h, err := NewHandler(t.Context(), Options{
+		Connection: ConnectionOptionsFromWorkflowServiceClient{
+			WorkflowServiceClient: &fakeWorkflowService{
+				start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+					require.Equal(t, "encoded/test", string(request.Input.Metadata[converter.MetadataEncoding]))
+					require.Equal(t, `prefix:{"value":1}`, string(request.Input.Data))
+					return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
+				},
+			},
+			Namespace: "embedded-namespace",
+		},
+		PayloadCodecs: []converter.PayloadCodec{codec},
+	})
+	require.NoError(t, err)
+
+	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"value":1}}`)
+	requireStatus(t, http.StatusCreated, response)
+	require.Equal(t, 1, codec.encoded)
+}
+
 // TestSuppliedWorkflowServiceClientLeavesIdentityEmpty pins that an unset
 // identity stays unset with a supplied WorkflowService client, as it does when
 // dialing.
@@ -361,7 +388,7 @@ func TestStartOperationCodec(t *testing.T) {
 		require.Equal(t, `prefix:{"value":1}`, string(request.Input.Data))
 		return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
 	}}
-	h := newTestHandler(t, service, Options{Connection: ConnectionOptionsFromClientOptions{PayloadCodecs: []converter.PayloadCodec{codec}}})
+	h := newTestHandler(t, service, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
 	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"value":1}}`)
 	requireStatus(t, http.StatusCreated, response)
 	require.Equal(t, 1, codec.encoded)
@@ -381,7 +408,7 @@ func TestStartOperationCodecSkipsSearchAttributes(t *testing.T) {
 			gotRequest = request
 			return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
 		},
-	}, Options{Connection: ConnectionOptionsFromClientOptions{PayloadCodecs: []converter.PayloadCodec{codec}}})
+	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
 
 	response := serve(h, http.MethodPost, "/operations/op", `{
 		"endpoint":"e","service":"s","operation":"o",
@@ -508,7 +535,7 @@ func TestReadAndActionRoutesUseProtoResponses(t *testing.T) {
 			return &workflowservice.TerminateNexusOperationExecutionResponse{}, nil
 		},
 	}
-	h := newTestHandler(t, service, Options{Connection: ConnectionOptionsFromClientOptions{PayloadCodecs: []converter.PayloadCodec{codec}}})
+	h := newTestHandler(t, service, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
 
 	tests := []struct {
 		method    string
@@ -715,7 +742,7 @@ func TestPollOperationFailurePreservesTemporalFailure(t *testing.T) {
 		poll: func(context.Context, *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
 			return &workflowservice.PollNexusOperationExecutionResponse{Outcome: &workflowservice.PollNexusOperationExecutionResponse_Failure{Failure: protoFailure}}, nil
 		},
-	}, Options{Connection: ConnectionOptionsFromClientOptions{PayloadCodecs: []converter.PayloadCodec{decodingCodec}}})
+	}, Options{PayloadCodecs: []converter.PayloadCodec{decodingCodec}})
 
 	response := serve(h, http.MethodGet, "/operations/op/poll", "")
 	requireStatus(t, http.StatusFailedDependency, response)
@@ -756,7 +783,7 @@ func TestPollOperationStartedStageHasNoOutcome(t *testing.T) {
 				OperationToken: "operation-token",
 			}, nil
 		},
-	}, Options{Connection: ConnectionOptionsFromClientOptions{PayloadCodecs: []converter.PayloadCodec{codec}}})
+	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
 
 	response := serve(h, http.MethodGet, "/operations/op/poll", "")
 	requireStatus(t, http.StatusOK, response)

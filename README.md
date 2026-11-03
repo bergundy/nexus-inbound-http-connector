@@ -181,9 +181,8 @@ address, TLS, credentials, and lifecycle. `WorkflowServiceClient` is required.
 `Namespace` is also required, since there is no dialed client whose default to
 follow, and is written to every request like `client.Options.Namespace`.
 `Identity` is used like `client.Options.Identity` and is left empty when
-unset. This variant takes no payload codecs; to apply
-[payload codecs](#payload-codecs), let the connector dial with
-`ConnectionOptionsFromClientOptions`.
+unset. [Payload codecs](#payload-codecs) apply the same way as with a dialed
+connection.
 
 ## Connector namespace
 
@@ -288,17 +287,16 @@ Add `?noPayloadShorthand` to use canonical protobuf JSON payloads instead. Add
 ### Payload codecs
 
 Codecs are applied inside the customer process at the raw WorkflowService
-payload boundary. They are set on `ConnectionOptionsFromClientOptions`, the
-connection the connector dials; a `WorkflowService` client passed in takes
-none:
+payload boundary. They are optional, set on `Options` rather than on a
+connection, and apply the same way whichever `Connection` is used:
 
 ```go
 handler, err := nexushttp.NewHandler(ctx, nexushttp.Options{
-	Connection: nexushttp.ConnectionOptionsFromClientOptions{
-		PayloadCodecs: []converter.PayloadCodec{myCodec},
-	},
+	PayloadCodecs: []converter.PayloadCodec{myCodec},
 })
 ```
+
+Without them, payloads are sent and returned unchanged.
 
 On start requests, codecs encode the parsed operation input before it is sent to
 Temporal. On describe and poll responses, they decode operation input, result,

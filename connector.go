@@ -50,6 +50,13 @@ type Options struct {
 	// Temporal environment configuration.
 	Connection ConnectionOptions
 
+	// PayloadCodecs are applied by the connector when reading and writing
+	// operation input, result, and failure payloads, whichever Connection is
+	// used. The connector calls the low-level WorkflowService directly, so no
+	// client data converter applies. Leave it empty to send and receive
+	// payloads unchanged.
+	PayloadCodecs []converter.PayloadCodec
+
 	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
 	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
 	// MaxRequestBodySize of zero rejects non-empty request bodies.
@@ -74,7 +81,6 @@ type connection struct {
 	service   workflowservice.WorkflowServiceClient
 	namespace string
 	identity  string
-	codecs    []converter.PayloadCodec
 	// close shuts down a connection NewHandler dialed, and is nil when the
 	// caller owns the connection.
 	close func()
@@ -111,15 +117,10 @@ type ConnectionOptionsFromClientOptions struct {
 	// the connector never calls, and is therefore ignored: DataConverter,
 	// FailureConverter, ContextPropagators, Interceptors, ExternalStorage,
 	// PayloadLimits, and the worker-only WorkerHeartbeatInterval, SdkName, and
-	// SdkVersion. Use PayloadCodecs for payload encoding. TEMPORAL_CODEC_*
-	// environment configuration is ignored for the same reason: it only
-	// configures a remote data converter.
+	// SdkVersion. Use [Options.PayloadCodecs] for payload encoding.
+	// TEMPORAL_CODEC_* environment configuration is ignored for the same
+	// reason: it only configures a remote data converter.
 	ClientOptions *client.Options
-
-	// PayloadCodecs are applied by the connector when reading and writing
-	// operation input, result, and failure payloads. Direct WorkflowService
-	// calls bypass the client's data converter.
-	PayloadCodecs []converter.PayloadCodec
 }
 
 func (o ConnectionOptionsFromClientOptions) connect(ctx context.Context) (connection, error) {
@@ -157,7 +158,6 @@ func (o ConnectionOptionsFromClientOptions) connection(service workflowservice.W
 		service:   service,
 		namespace: cmp.Or(clientOptions.Namespace, client.DefaultNamespace),
 		identity:  clientOptions.Identity,
-		codecs:    append([]converter.PayloadCodec(nil), o.PayloadCodecs...),
 	}
 }
 
@@ -251,7 +251,7 @@ func newHandler(c connection, options Options) http.Handler {
 		service:   c.service,
 		namespace: c.namespace,
 		identity:  c.identity,
-		codecs:    c.codecs,
+		codecs:    append([]converter.PayloadCodec(nil), options.PayloadCodecs...),
 		logger:    cmp.Or(options.Logger, slog.Default()),
 	}
 	mux := http.NewServeMux()
