@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -43,17 +44,28 @@ func TestResolveClientOptionsFromEnvironment(t *testing.T) {
 	t.Setenv("TEMPORAL_ADDRESS", "temporal.example.com:7233")
 	t.Setenv("TEMPORAL_NAMESPACE", "env-namespace")
 
-	clientOptions, err := resolveClientOptions(Options{})
+	clientOptions, err := ConnectionOptionsFromClientOptions{}.resolveClientOptions()
 	require.NoError(t, err)
 	require.Equal(t, "temporal.example.com:7233", clientOptions.HostPort)
 	require.Equal(t, "env-namespace", clientOptions.Namespace)
 
 	// Supplied options are used as-is, without consulting the environment.
 	supplied := client.Options{HostPort: "supplied:7233", Namespace: "supplied-namespace"}
-	clientOptions, err = resolveClientOptions(Options{ClientOptions: &supplied})
+	clientOptions, err = ConnectionOptionsFromClientOptions{ClientOptions: &supplied}.resolveClientOptions()
 	require.NoError(t, err)
 	require.Equal(t, supplied.HostPort, clientOptions.HostPort)
 	require.Equal(t, supplied.Namespace, clientOptions.Namespace)
+}
+
+// TestNilConnectionLoadsEnvironment pins that NewHandler without a Connection
+// dials from Temporal environment configuration, like
+// ConnectionOptionsFromClientOptions{}: the config file it reads is invalid,
+// so the load fails before anything is dialed.
+func TestNilConnectionLoadsEnvironment(t *testing.T) {
+	writeInvalidConfigFile(t)
+
+	_, err := NewHandler(t.Context(), Options{})
+	require.ErrorContains(t, err, "load Temporal environment configuration")
 }
 
 // TestNamespaceDefaultsLikeTheSDK keeps the connector's namespace default in
@@ -66,7 +78,7 @@ func TestNamespaceDefaultsLikeTheSDK(t *testing.T) {
 			gotRequest = request
 			return &workflowservice.CountNexusOperationExecutionsResponse{}, nil
 		},
-	}, Options{ClientOptions: &client.Options{}})
+	}, Options{Connection: ConnectionOptionsFromClientOptions{ClientOptions: &client.Options{}}})
 
 	response := serve(h, http.MethodGet, "/operation-count", "")
 	requireStatus(t, http.StatusOK, response)
@@ -93,7 +105,7 @@ func TestIdentityComesFromClientOptions(t *testing.T) {
 			gotTerminate = request
 			return &workflowservice.TerminateNexusOperationExecutionResponse{}, nil
 		},
-	}, Options{ClientOptions: &client.Options{Namespace: "test-namespace", Identity: "connector-identity"}})
+	}, Options{Connection: ConnectionOptionsFromClientOptions{ClientOptions: &client.Options{Namespace: "test-namespace", Identity: "connector-identity"}}})
 
 	serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`)
 	serve(h, http.MethodPost, "/operations/op/cancel", `{}`)
@@ -118,6 +130,140 @@ func TestIdentityIsNotSynthesized(t *testing.T) {
 
 	serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`)
 	require.Empty(t, gotStart.Identity)
+}
+
+// TestNewHandlerUsesSuppliedWorkflowServiceClient pins that a supplied
+// WorkflowService client is used instead of dialing: NewHandler succeeds with
+// an already-canceled context, which a dial would fail on, and requests carry
+// the given namespace and identity.
+func TestNewHandlerUsesSuppliedWorkflowServiceClient(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	var gotStart *workflowservice.StartNexusOperationExecutionRequest
+	h, err := NewHandler(ctx, Options{Connection: ConnectionOptionsFromWorkflowServiceClient{
+		WorkflowServiceClient: &fakeWorkflowService{
+			start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+				gotStart = request
+				return &workflowservice.StartNexusOperationExecutionResponse{}, nil
+			},
+		},
+		Identity:  "embedded-identity",
+		Namespace: "embedded-namespace",
+	}})
+	require.NoError(t, err)
+
+	requireStatus(t, http.StatusCreated, serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`))
+	require.Equal(t, "embedded-namespace", gotStart.Namespace)
+	require.Equal(t, "embedded-identity", gotStart.Identity)
+
+	// Close must not panic when nothing was dialed.
+	h.Close()
+}
+
+// TestSuppliedWorkflowServiceClientAppliesPayloadCodecs pins that payload codecs
+// apply the same way with a supplied WorkflowService client as with a dialed
+// one.
+func TestSuppliedWorkflowServiceClientAppliesPayloadCodecs(t *testing.T) {
+	t.Parallel()
+
+	codec := &prefixCodec{}
+	h, err := NewHandler(t.Context(), Options{
+		Connection: ConnectionOptionsFromWorkflowServiceClient{
+			WorkflowServiceClient: &fakeWorkflowService{
+				start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+					require.Equal(t, "encoded/test", string(request.Input.Metadata[converter.MetadataEncoding]))
+					require.Equal(t, `prefix:{"value":1}`, string(request.Input.Data))
+					return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
+				},
+			},
+			Namespace: "embedded-namespace",
+		},
+		PayloadCodecs: []converter.PayloadCodec{codec},
+	})
+	require.NoError(t, err)
+
+	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"value":1}}`)
+	requireStatus(t, http.StatusCreated, response)
+	require.Equal(t, 1, codec.encoded)
+}
+
+// TestSuppliedWorkflowServiceClientLeavesIdentityEmpty pins that an unset
+// identity stays unset with a supplied WorkflowService client, as it does when
+// dialing.
+func TestSuppliedWorkflowServiceClientLeavesIdentityEmpty(t *testing.T) {
+	t.Parallel()
+	var gotStart *workflowservice.StartNexusOperationExecutionRequest
+	h, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromWorkflowServiceClient{
+		WorkflowServiceClient: &fakeWorkflowService{
+			start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+				gotStart = request
+				return &workflowservice.StartNexusOperationExecutionResponse{}, nil
+			},
+		},
+		Namespace: "embedded-namespace",
+	}})
+	require.NoError(t, err)
+
+	requireStatus(t, http.StatusCreated, serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o"}`))
+	require.Empty(t, gotStart.Identity)
+}
+
+// TestSuppliedWorkflowServiceClientSkipsEnvironment pins that NewHandler reads
+// no Temporal environment configuration when given a WorkflowService client:
+// the config file it would read is invalid, so any attempt to load it would
+// fail.
+func TestSuppliedWorkflowServiceClientSkipsEnvironment(t *testing.T) {
+	writeInvalidConfigFile(t)
+	t.Setenv("TEMPORAL_NAMESPACE", "env-namespace")
+
+	var gotRequest *workflowservice.CountNexusOperationExecutionsRequest
+	h, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromWorkflowServiceClient{
+		WorkflowServiceClient: &fakeWorkflowService{
+			count: func(_ context.Context, request *workflowservice.CountNexusOperationExecutionsRequest) (*workflowservice.CountNexusOperationExecutionsResponse, error) {
+				gotRequest = request
+				return &workflowservice.CountNexusOperationExecutionsResponse{}, nil
+			},
+		},
+		Namespace: "embedded-namespace",
+	}})
+	require.NoError(t, err)
+
+	requireStatus(t, http.StatusOK, serve(h, http.MethodGet, "/operation-count", ""))
+	require.Equal(t, "embedded-namespace", gotRequest.Namespace)
+}
+
+// TestSuppliedWorkflowServiceClientRequiresNamespace pins that a supplied
+// WorkflowService client needs an explicit namespace: there is no dialed
+// client whose default it could follow.
+func TestSuppliedWorkflowServiceClientRequiresNamespace(t *testing.T) {
+	t.Parallel()
+	_, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromWorkflowServiceClient{
+		WorkflowServiceClient: &fakeWorkflowService{},
+		Identity:              "embedded-identity",
+	}})
+	require.EqualError(t, err, "ConnectionOptionsFromWorkflowServiceClient.Namespace is required")
+}
+
+// TestSuppliedWorkflowServiceClientRequiresClient pins that a nil
+// WorkflowService client is rejected up front rather than on the first
+// request.
+func TestSuppliedWorkflowServiceClientRequiresClient(t *testing.T) {
+	t.Parallel()
+	_, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromWorkflowServiceClient{
+		Namespace: "embedded-namespace",
+	}})
+	require.EqualError(t, err, "ConnectionOptionsFromWorkflowServiceClient.WorkflowServiceClient is required")
+}
+
+// writeInvalidConfigFile points TEMPORAL_CONFIG_FILE at a file that is not
+// valid TOML, so any attempt to load Temporal environment configuration fails.
+func writeInvalidConfigFile(t *testing.T) {
+	t.Helper()
+	configFile := filepath.Join(t.TempDir(), "temporal.toml")
+	require.NoError(t, os.WriteFile(configFile, []byte("not [valid toml"), 0o600))
+	t.Setenv("TEMPORAL_CONFIG_FILE", configFile)
 }
 
 func TestMaxRequestBodySize(t *testing.T) {
@@ -174,7 +320,7 @@ func TestStartOperationProtoJSON(t *testing.T) {
 		gotRequest = request
 		return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1", Started: true}, nil
 	}}
-	h := newTestHandler(t, service, Options{ClientOptions: &client.Options{Namespace: "configured-namespace"}})
+	h := newTestHandler(t, service, Options{Connection: ConnectionOptionsFromClientOptions{ClientOptions: &client.Options{Namespace: "configured-namespace"}}})
 
 	body := `{
 		"requestId":"body-start-request",
@@ -703,15 +849,18 @@ func TestUnmappedGRPCCodeIsInternal(t *testing.T) {
 }
 
 // newTestHandler builds the routed handler around a fake WorkflowService,
-// skipping the Temporal connection NewHandler would dial. ClientOptions
+// skipping the Temporal connection NewHandler would dial. options.Connection,
+// when set, must be a ConnectionOptionsFromClientOptions, whose ClientOptions
 // defaults to the namespace the request assertions expect.
 func newTestHandler(t *testing.T, service workflowservice.WorkflowServiceClient, options Options) http.Handler {
 	t.Helper()
+	connectionOptions, ok := options.Connection.(ConnectionOptionsFromClientOptions)
+	require.True(t, ok || options.Connection == nil, "newTestHandler needs ConnectionOptionsFromClientOptions")
 	clientOptions := client.Options{Namespace: "test-namespace"}
-	if options.ClientOptions != nil {
-		clientOptions = *options.ClientOptions
+	if connectionOptions.ClientOptions != nil {
+		clientOptions = *connectionOptions.ClientOptions
 	}
-	return newHandler(service, clientOptions, options)
+	return newHandler(connectionOptions.connection(service, clientOptions), options)
 }
 
 // newBareHandler builds a handler without routing, for tests that exercise a
