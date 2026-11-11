@@ -7,6 +7,7 @@ import (
 	commonpb "go.temporal.io/api/common/v1"
 	failurepb "go.temporal.io/api/failure/v1"
 	"go.temporal.io/api/proxy"
+	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/sdk/converter"
 	"google.golang.org/protobuf/proto"
@@ -18,15 +19,20 @@ import (
 //
 // Search attributes are deliberately left unencoded: the server indexes them,
 // so it has to be able to read them.
-func (h *handler) encodeOutbound(ctx context.Context, message proto.Message) error {
+//
+// serializationContext, when non-nil, is passed to the codecs that accept one.
+// See codecsFor for the payloads it applies to.
+func (h *handler) encodeOutbound(ctx context.Context, message proto.Message, serializationContext converter.SerializationContext) error {
 	if len(h.codecs) == 0 {
 		return nil
 	}
+	contextualCodecs := withSerializationContext(h.codecs, serializationContext)
 	return proxy.VisitPayloads(ctx, message, proxy.VisitPayloadsOptions{
 		Visitor: func(visit *proxy.VisitPayloadsContext, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+			codecs := h.codecsFor(visit, contextualCodecs)
 			var err error
-			for i := len(h.codecs) - 1; i >= 0; i-- {
-				if payloads, err = h.codecs[i].Encode(payloads); err != nil {
+			for i := len(codecs) - 1; i >= 0; i-- {
+				if payloads, err = codecs[i].Encode(payloads); err != nil {
 					return nil, err
 				}
 				if err := checkSinglePayload(visit, payloads); err != nil {
@@ -48,13 +54,14 @@ func (h *handler) encodeOutbound(ctx context.Context, message proto.Message) err
 // Both traversals come from go.temporal.io/api/proxy, which is generated from
 // the protos, so payload and failure fields added upstream are handled without
 // a change here.
-func (h *handler) decodeInbound(ctx context.Context, message proto.Message) error {
+func (h *handler) decodeInbound(ctx context.Context, message proto.Message, serializationContext converter.SerializationContext) error {
 	if len(h.codecs) == 0 {
 		return nil
 	}
+	contextualCodecs := withSerializationContext(h.codecs, serializationContext)
 	err := proxy.VisitPayloads(ctx, message, proxy.VisitPayloadsOptions{
 		Visitor: func(visit *proxy.VisitPayloadsContext, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
-			decoded, err := h.decodePayloads(payloads)
+			decoded, err := decodePayloads(h.codecsFor(visit, contextualCodecs), payloads)
 			if err != nil {
 				return nil, err
 			}
@@ -86,12 +93,48 @@ func (h *handler) encodeStartRequest(ctx context.Context, request *workflowservi
 			Metadata: map[string][]byte{converter.MetadataEncoding: []byte(converter.MetadataEncodingNil)},
 		}
 	}
-	return h.encodeOutbound(ctx, request)
+	return h.encodeOutbound(ctx, request, nexusSerializationContext(request.Endpoint, request.Service, request.Operation))
 }
 
-func (h *handler) decodePayloads(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+// nexusSerializationContext returns the serialization context for the payloads
+// of the operation identified by endpoint, service, and operation, or nil when
+// none of them is known.
+func nexusSerializationContext(endpoint, service, operation string) converter.SerializationContext {
+	if endpoint == "" && service == "" && operation == "" {
+		return nil
+	}
+	return converter.NexusSerializationContext{Endpoint: endpoint, Service: service, Operation: operation}
+}
+
+// withSerializationContext returns codecs with serializationContext passed to
+// every codec that accepts one, or codecs itself when there is no context.
+func withSerializationContext(codecs []converter.PayloadCodec, serializationContext converter.SerializationContext) []converter.PayloadCodec {
+	if serializationContext == nil {
+		return codecs
+	}
+	contextual := make([]converter.PayloadCodec, len(codecs))
+	for i, codec := range codecs {
+		if c, ok := codec.(converter.PayloadCodecWithSerializationContext); ok {
+			codec = c.WithSerializationContext(serializationContext)
+		}
+		contextual[i] = codec
+	}
+	return contextual
+}
+
+// codecsFor picks the codec chain for the payloads being visited. User metadata
+// belongs to the execution rather than to the operation's payloads, so, as in
+// the SDK, it is encoded without serialization context.
+func (h *handler) codecsFor(visit *proxy.VisitPayloadsContext, contextualCodecs []converter.PayloadCodec) []converter.PayloadCodec {
+	if _, ok := visit.Parent.(*sdkpb.UserMetadata); ok {
+		return h.codecs
+	}
+	return contextualCodecs
+}
+
+func decodePayloads(codecs []converter.PayloadCodec, payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
 	var err error
-	for _, codec := range h.codecs {
+	for _, codec := range codecs {
 		if payloads, err = codec.Decode(payloads); err != nil {
 			return nil, err
 		}
