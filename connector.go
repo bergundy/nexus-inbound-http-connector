@@ -77,6 +77,11 @@ type Options struct {
 	// PayloadCodecs are applied by the connector when reading and writing
 	// operation input, result, and failure payloads. Direct WorkflowService
 	// calls bypass the client's data converter.
+	//
+	// Codecs implementing converter.PayloadCodecWithSerializationContext
+	// receive a converter.NexusSerializationContext naming the operation's
+	// endpoint, service, and operation for those payloads. User metadata is
+	// encoded and decoded without context, as in the SDK.
 	PayloadCodecs []converter.PayloadCodec
 
 	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
@@ -212,11 +217,7 @@ func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	h.writeProto(w, query, http.StatusCreated, &workflowservice.StartNexusOperationExecutionResponse{
-		// Started is intentionally omitted. The connector's public start response
-		// only promises the run ID.
-		RunId: response.GetRunId(),
-	})
+	h.writeProto(w, query, http.StatusCreated, response)
 }
 
 func validateStartRequest(request *workflowservice.StartNexusOperationExecutionRequest) error {
@@ -291,7 +292,9 @@ func (h *handler) describeOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, errors.New("empty describe response from Temporal"))
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	info := response.GetInfo()
+	serializationContext := nexusSerializationContext(info.GetEndpoint(), info.GetService(), info.GetOperation())
+	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
 		h.writeError(w, fmt.Errorf("decode describe response: %w", err))
 		return
 	}
@@ -315,7 +318,11 @@ func (h *handler) pollOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	// Servers without serialization context propagation omit the context, and
+	// the codecs then run without one.
+	propagated := response.GetPropagatedNexusSerializationContext()
+	serializationContext := nexusSerializationContext(propagated.GetEndpoint(), propagated.GetService(), propagated.GetOperation())
+	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
 		h.writeError(w, fmt.Errorf("decode poll response: %w", err))
 		return
 	}
@@ -355,7 +362,7 @@ func (h *handler) listOperations(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
 		h.writeError(w, fmt.Errorf("decode list response: %w", err))
 		return
 	}
@@ -372,7 +379,7 @@ func (h *handler) countOperations(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
 		h.writeError(w, fmt.Errorf("decode count response: %w", err))
 		return
 	}
@@ -395,7 +402,7 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request); err != nil {
+	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
 		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
 		return
 	}
@@ -404,7 +411,7 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
 		h.writeError(w, fmt.Errorf("decode cancel response: %w", err))
 		return
 	}
@@ -427,7 +434,7 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request); err != nil {
+	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
 		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
 		return
 	}
@@ -436,7 +443,7 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response); err != nil {
+	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
 		h.writeError(w, fmt.Errorf("decode terminate response: %w", err))
 		return
 	}

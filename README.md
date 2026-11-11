@@ -217,10 +217,12 @@ Request-Id: start-request-1
 
 Start always returns `201 Created` with a
 `temporal.api.workflowservice.v1.StartNexusOperationExecutionResponse`
-containing only the operation run ID. The `started` field is intentionally not
-populated, even when Temporal reports that a new operation was started.
-Describe, poll, list, count, cancel, and terminate return their generated
-WorkflowService response messages. Cancellation and termination also read their
+containing the operation run ID and `started`, which is true when a new
+operation was started and false when an existing one was reused. Describe,
+poll, list, count, cancel, and terminate return their generated
+WorkflowService response messages. Poll responses include
+`propagatedNexusSerializationContext`, the endpoint, service, and operation the
+result and failure payloads were serialized for, when the server provides it. Cancellation and termination also read their
 Temporal request IDs from `Request-Id`; omitted values are generated, and body
 `requestId` fields are ignored.
 Cancellation returns `202 Accepted` because it is eventually consistent.
@@ -258,6 +260,15 @@ and failure payloads before those values are rendered as protobuf JSON or a
 Nexus Failure. Low-level WorkflowService calls bypass the client's data
 converter, so `PayloadCodecs` is the codec chain for these raw payloads, and
 `ClientOptions.DataConverter` is ignored.
+
+Codecs that implement `converter.PayloadCodecWithSerializationContext` receive a
+`converter.NexusSerializationContext` with the operation's endpoint, service,
+and operation for its input, result, and failure payloads, matching the SDK's
+Nexus client. Start takes the context from the request, describe from the
+returned operation info, and poll from the server's propagated serialization
+context. Poll responses from servers that do not propagate the context are
+decoded without one. User metadata is always encoded and decoded without
+context.
 
 ## Failures
 

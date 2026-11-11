@@ -21,6 +21,7 @@ import (
 	enumspb "go.temporal.io/api/enums/v1"
 	failurepb "go.temporal.io/api/failure/v1"
 	nexuspb "go.temporal.io/api/nexus/v1"
+	sdkpb "go.temporal.io/api/sdk/v1"
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/api/temporalproto"
 	"go.temporal.io/api/workflowservice/v1"
@@ -228,8 +229,7 @@ func TestStartOperationProtoJSON(t *testing.T) {
 	err := temporalproto.CustomJSONUnmarshalOptions{Metadata: newRequestQuery(request).payloadMetadata()}.Unmarshal(response.Body.Bytes(), decoded)
 	require.NoError(t, err, "unmarshal response")
 	require.Equal(t, "run-1", decoded.RunId)
-	require.False(t, decoded.Started)
-	require.NotContains(t, response.Body.String(), `"started"`)
+	require.True(t, decoded.Started)
 }
 
 func TestStartOperationCodec(t *testing.T) {
@@ -280,6 +280,116 @@ func TestStartOperationCodecSkipsSearchAttributes(t *testing.T) {
 	require.Equal(t, `prefix:"card authorization"`, string(gotRequest.UserMetadata.GetSummary().GetData()), "user metadata summary must be encoded")
 	// Input and the user metadata summary, but not the search attribute.
 	require.Equal(t, 2, codec.encoded)
+}
+
+// TestStartOperationCodecSerializationContext pins which payloads codecs see
+// the operation's serialization context for: the input does, and the user
+// metadata, which the SDK also encodes without context, does not.
+func TestStartOperationCodecSerializationContext(t *testing.T) {
+	t.Parallel()
+
+	codec := &contextRecordingCodec{}
+	h := newTestHandler(t, &fakeWorkflowService{
+		start: func(context.Context, *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+			return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
+		},
+	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+
+	response := serve(h, http.MethodPost, "/operations/op", `{
+		"endpoint":"e","service":"s","operation":"o",
+		"input":"in",
+		"userMetadata":{"summary":"sum"}
+	}`)
+	requireStatus(t, http.StatusCreated, response)
+
+	require.ElementsMatch(t, []codecCall{
+		{"encode", `"in"`, converter.NexusSerializationContext{Endpoint: "e", Service: "s", Operation: "o"}},
+		{"encode", `"sum"`, nil},
+	}, codec.recorded())
+}
+
+func TestDescribeOperationCodecSerializationContext(t *testing.T) {
+	t.Parallel()
+
+	codec := &contextRecordingCodec{}
+	h := newTestHandler(t, &fakeWorkflowService{
+		describe: func(context.Context, *workflowservice.DescribeNexusOperationExecutionRequest) (*workflowservice.DescribeNexusOperationExecutionResponse, error) {
+			return &workflowservice.DescribeNexusOperationExecutionResponse{
+				Info: &nexuspb.NexusOperationExecutionInfo{
+					OperationId:  "op",
+					Endpoint:     "e",
+					Service:      "s",
+					Operation:    "o",
+					UserMetadata: &sdkpb.UserMetadata{Summary: jsonPayload(`"sum"`)},
+					LastAttemptFailure: &failurepb.Failure{
+						Message:           "attempt failed",
+						EncodedAttributes: jsonPayload(`{"message":"attempt failed"}`),
+					},
+				},
+				Input: jsonPayload(`"in"`),
+				Outcome: &workflowservice.DescribeNexusOperationExecutionResponse_Failure{Failure: &failurepb.Failure{
+					Message:           "failed",
+					EncodedAttributes: jsonPayload(`{"message":"failed"}`),
+				}},
+			}, nil
+		},
+	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+
+	response := serve(h, http.MethodGet, "/operations/op?includeInput=true&includeOutcome=true", "")
+	requireStatus(t, http.StatusOK, response)
+
+	nexusContext := converter.NexusSerializationContext{Endpoint: "e", Service: "s", Operation: "o"}
+	require.ElementsMatch(t, []codecCall{
+		{"decode", `"in"`, nexusContext},
+		{"decode", `{"message":"failed"}`, nexusContext},
+		{"decode", `{"message":"attempt failed"}`, nexusContext},
+		{"decode", `"sum"`, nil},
+	}, codec.recorded())
+}
+
+func TestPollOperationCodecSerializationContext(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		propagated *nexuspb.PropagatedSerializationContext
+		want       converter.SerializationContext
+	}{
+		"propagated": {
+			propagated: &nexuspb.PropagatedSerializationContext{Endpoint: "e", Service: "s", Operation: "o"},
+			want:       converter.NexusSerializationContext{Endpoint: "e", Service: "s", Operation: "o"},
+		},
+		// Servers without serialization context propagation omit it.
+		"not propagated": {},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			codec := &contextRecordingCodec{}
+			h := newTestHandler(t, &fakeWorkflowService{
+				poll: func(context.Context, *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
+					return &workflowservice.PollNexusOperationExecutionResponse{
+						WaitStage:                           enumspb.NEXUS_OPERATION_WAIT_STAGE_CLOSED,
+						PropagatedNexusSerializationContext: test.propagated,
+						Outcome:                             &workflowservice.PollNexusOperationExecutionResponse_Result{Result: jsonPayload(`"out"`)},
+					}, nil
+				},
+			}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+
+			response := serve(h, http.MethodGet, "/operations/op/poll", "")
+			requireStatus(t, http.StatusOK, response)
+
+			require.Equal(t, []codecCall{{"decode", `"out"`, test.want}}, codec.recorded())
+
+			// The context is returned to the caller as received.
+			var body map[string]any
+			require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+			if test.propagated == nil {
+				require.NotContains(t, body, "propagatedNexusSerializationContext")
+			} else {
+				require.Equal(t, map[string]any{"endpoint": "e", "service": "s", "operation": "o"}, body["propagatedNexusSerializationContext"])
+			}
+		})
+	}
 }
 
 func TestPayloadShorthandNullRoundTrip(t *testing.T) {
@@ -809,3 +919,57 @@ func (c *prefixCodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload,
 }
 
 var _ converter.PayloadCodec = (*prefixCodec)(nil)
+
+// contextRecordingCodec passes payloads through unchanged and records, for
+// each one, the serialization context it was given.
+type contextRecordingCodec struct {
+	calls   *[]codecCall
+	context converter.SerializationContext
+}
+
+type codecCall struct {
+	op      string
+	data    string
+	context converter.SerializationContext
+}
+
+func (c *contextRecordingCodec) WithSerializationContext(serializationContext converter.SerializationContext) converter.PayloadCodec {
+	c.init()
+	return &contextRecordingCodec{calls: c.calls, context: serializationContext}
+}
+
+func (c *contextRecordingCodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+	return c.record("encode", payloads), nil
+}
+
+func (c *contextRecordingCodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+	return c.record("decode", payloads), nil
+}
+
+func (c *contextRecordingCodec) record(op string, payloads []*commonpb.Payload) []*commonpb.Payload {
+	c.init()
+	for _, payload := range payloads {
+		*c.calls = append(*c.calls, codecCall{op, string(payload.Data), c.context})
+	}
+	return payloads
+}
+
+func (c *contextRecordingCodec) init() {
+	if c.calls == nil {
+		c.calls = &[]codecCall{}
+	}
+}
+
+func (c *contextRecordingCodec) recorded() []codecCall {
+	c.init()
+	return *c.calls
+}
+
+var _ converter.PayloadCodecWithSerializationContext = (*contextRecordingCodec)(nil)
+
+func jsonPayload(data string) *commonpb.Payload {
+	return &commonpb.Payload{
+		Metadata: map[string][]byte{converter.MetadataEncoding: []byte(converter.MetadataEncodingJSON)},
+		Data:     []byte(data),
+	}
+}
