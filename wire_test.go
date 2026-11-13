@@ -40,10 +40,10 @@ func TestIdentityHeadersReachTheWire(t *testing.T) {
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(server.Stop)
 
-	h, err := NewHandler(context.Background(), Options{ClientOptions: &client.Options{
+	h, err := NewHandler(context.Background(), Options{Connection: ConnectionOptionsFromClientOptions{ClientOptions: &client.Options{
 		HostPort:        listener.Addr().String(),
 		HeadersProvider: staticHeaders{"x-a": "b"},
-	}})
+	}}})
 	require.NoError(t, err)
 	t.Cleanup(h.Close)
 

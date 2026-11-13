@@ -1,6 +1,7 @@
 // Package nexushttp provides an HTTP handler for invoking Temporal Standalone
-// Nexus Operations through a Temporal Go SDK client it dials from
-// caller-supplied client options.
+// Nexus Operations, through a Temporal Go SDK client it dials from
+// caller-supplied client options or through a caller-supplied WorkflowService
+// client.
 package nexushttp
 
 import (
@@ -12,6 +13,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 
 	"github.com/google/uuid"
 	"go.temporal.io/api/temporalproto"
@@ -19,6 +21,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/envconfig"
 	"go.temporal.io/sdk/converter"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -75,7 +78,47 @@ func (MaxRequestBodySizeNotEnforced) requestBodySizeLimit() {}
 
 // Options configures a Nexus HTTP handler.
 type Options struct {
-	// ClientOptions configures the Temporal client [NewHandler] dials. When it
+	// Connection selects how the handler reaches Temporal: a client
+	// [NewHandler] dials from client options, with
+	// [ConnectionOptionsFromClientOptions], or a WorkflowService client the
+	// caller already holds, with [ConnectionOptionsFromWorkflowServiceClient].
+	// It defaults to ConnectionOptionsFromClientOptions{}, which dials from
+	// Temporal environment configuration.
+	Connection ConnectionOptions
+
+	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
+	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
+	// MaxRequestBodySize of zero rejects non-empty request bodies.
+	MaxRequestBodySize RequestBodySizeLimit
+
+	// Logger records internal server errors, each under a generated ID that is
+	// also the only detail the caller receives. It defaults to slog.Default().
+	Logger *slog.Logger
+}
+
+// ConnectionOptions is a closed set of ways for the handler to reach Temporal:
+// [ConnectionOptionsFromClientOptions] and
+// [ConnectionOptionsFromWorkflowServiceClient].
+type ConnectionOptions interface {
+	// connect returns the connection the handler serves requests over. ctx
+	// bounds any connection attempt only.
+	connect(ctx context.Context) (connection, error)
+}
+
+// connection is what the handler needs from Temporal, however it was reached.
+type connection struct {
+	service   workflowservice.WorkflowServiceClient
+	namespace string
+	identity  string
+	// close shuts down a connection NewHandler dialed, and is nil when the
+	// caller owns the connection.
+	close func()
+}
+
+// ConnectionOptionsFromClientOptions makes [NewHandler] dial its own Temporal
+// client, which [Handler.Close] closes.
+type ConnectionOptionsFromClientOptions struct {
+	// ClientOptions configures the Temporal client NewHandler dials. When it
 	// is nil, NewHandler loads the options from Temporal environment
 	// configuration with [envconfig.LoadDefaultClientOptions]: the TEMPORAL_*
 	// environment variables layered over the temporal.toml profile they select.
@@ -110,80 +153,49 @@ type Options struct {
 	// configures a remote data converter.
 	ClientOptions *client.Options
 
-	// PayloadCodecs are applied by the connector when reading and writing
-	// operation input, result, and failure payloads. Direct WorkflowService
-	// calls bypass the client's data converter.
-	//
-	// Codecs implementing converter.PayloadCodecWithSerializationContext
-	// receive a converter.NexusSerializationContext naming the operation's
-	// endpoint, service, and operation for those payloads. User metadata is
-	// encoded and decoded without context, as in the SDK.
+	// PayloadCodecs are applied to the payloads of every call on the dialed
+	// connection, by the interceptor [NewPayloadCodecInterceptor] returns,
+	// installed innermost: after the SDK's own interceptors and any of
+	// ClientOptions' dial options. MetricsHandler therefore counts codec work as
+	// call latency, and a codec error as a failed call. The connector calls the
+	// low-level WorkflowService directly, so no client data converter applies.
+	// Leave it empty to send and receive payloads unchanged.
 	PayloadCodecs []converter.PayloadCodec
-
-	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
-	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
-	// MaxRequestBodySize of zero rejects non-empty request bodies.
-	MaxRequestBodySize RequestBodySizeLimit
-
-	// Logger records internal server errors, each under a generated ID that is
-	// also the only detail the caller receives. It defaults to slog.Default().
-	Logger *slog.Logger
 }
 
-type handler struct {
-	service   workflowservice.WorkflowServiceClient
-	namespace string
-	identity  string
-	codecs    []converter.PayloadCodec
-	logger    *slog.Logger
-}
-
-// Handler serves the complete Standalone Nexus Operation API over HTTP and owns
-// the Temporal connection it dialed. Close it to release that connection.
-type Handler struct {
-	mux http.Handler
-	// close shuts down the dialed connection. The SDK client it came from is
-	// not retained: the connector only needs the WorkflowService stub bound to
-	// that connection, which it captured in mux.
-	close func()
-}
-
-// NewHandler dials Temporal and returns a handler for the complete Standalone
-// Nexus Operation API. The context bounds the connection attempt only; served
-// requests use their own contexts. Callers own the returned handler's
-// connection and must call [Handler.Close] when they are done with it.
-func NewHandler(ctx context.Context, options Options) (*Handler, error) {
-	clientOptions, err := resolveClientOptions(options)
+func (o ConnectionOptionsFromClientOptions) connect(ctx context.Context) (connection, error) {
+	clientOptions, err := o.resolveClientOptions()
 	if err != nil {
-		return nil, err
+		return connection{}, err
 	}
 	clientOptions.HeadersProvider = identityHeadersProvider{next: clientOptions.HeadersProvider}
+	if len(o.PayloadCodecs) > 0 {
+		codecs, err := NewPayloadCodecInterceptor(o.PayloadCodecs)
+		if err != nil {
+			return connection{}, fmt.Errorf("build payload codec interceptor: %w", err)
+		}
+		// Clipped so the append never writes into the caller's slice.
+		clientOptions.ConnectionOptions.DialOptions = append(
+			slices.Clip(clientOptions.ConnectionOptions.DialOptions),
+			grpc.WithChainUnaryInterceptor(codecs),
+		)
+	}
 	temporalClient, err := client.DialContext(ctx, clientOptions)
 	if err != nil {
-		return nil, fmt.Errorf("dial Temporal: %w", err)
+		return connection{}, fmt.Errorf("dial Temporal: %w", err)
 	}
-	return &Handler{
-		mux:   newHandler(temporalClient.WorkflowService(), clientOptions, options),
-		close: temporalClient.Close,
-	}, nil
-}
-
-// ServeHTTP implements [http.Handler].
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.mux.ServeHTTP(w, r)
-}
-
-// Close closes the Temporal connection [NewHandler] dialed. It does not wait
-// for in-flight HTTP requests; shut down the HTTP server first.
-func (h *Handler) Close() {
-	h.close()
+	// The SDK client is not retained: the connector only needs the
+	// WorkflowService stub bound to its connection, and its Close.
+	c := o.connection(temporalClient.WorkflowService(), clientOptions)
+	c.close = temporalClient.Close
+	return c, nil
 }
 
 // resolveClientOptions returns the client options to dial with, loading them
 // from Temporal environment configuration when the caller supplied none.
-func resolveClientOptions(options Options) (client.Options, error) {
-	if options.ClientOptions != nil {
-		return *options.ClientOptions, nil
+func (o ConnectionOptionsFromClientOptions) resolveClientOptions() (client.Options, error) {
+	if o.ClientOptions != nil {
+		return *o.ClientOptions, nil
 	}
 	clientOptions, err := envconfig.LoadDefaultClientOptions()
 	if err != nil {
@@ -192,14 +204,108 @@ func resolveClientOptions(options Options) (client.Options, error) {
 	return clientOptions, nil
 }
 
-// newHandler builds the routed HTTP handler around an already-connected
-// WorkflowService client.
-func newHandler(service workflowservice.WorkflowServiceClient, clientOptions client.Options, options Options) http.Handler {
-	h := &handler{
+// connection describes service, bound to a client dialed from clientOptions.
+func (o ConnectionOptionsFromClientOptions) connection(service workflowservice.WorkflowServiceClient, clientOptions client.Options) connection {
+	return connection{
 		service:   service,
 		namespace: cmp.Or(clientOptions.Namespace, client.DefaultNamespace),
 		identity:  clientOptions.Identity,
-		codecs:    append([]converter.PayloadCodec(nil), options.PayloadCodecs...),
+	}
+}
+
+// ConnectionOptionsFromWorkflowServiceClient makes [NewHandler] serve the API
+// over a WorkflowService client the caller already holds, such as one with its
+// own routing, credentials, or interceptors, instead of dialing a second
+// connection. NewHandler dials nothing and loads no environment configuration,
+// and [Handler.Close] does nothing: the caller owns the client, including its
+// address, TLS, credentials, and lifecycle.
+//
+// Payload encoding is the client's too: the connector applies no codecs to its
+// calls. Install the interceptor [NewPayloadCodecInterceptor] returns on the
+// client's connection to encode payloads as a dialed connection would.
+type ConnectionOptionsFromWorkflowServiceClient struct {
+	// WorkflowServiceClient is used for every Temporal call. It is required
+	// and must be ready to use.
+	WorkflowServiceClient workflowservice.WorkflowServiceClient
+
+	// Identity is written to start, cancel, and terminate requests whose body
+	// omits an identity. It is left unset when empty.
+	Identity string
+
+	// Namespace is written to every WorkflowService request. It is required:
+	// there is no dialed client whose default it could follow.
+	Namespace string
+}
+
+func (o ConnectionOptionsFromWorkflowServiceClient) connect(context.Context) (connection, error) {
+	if o.WorkflowServiceClient == nil {
+		return connection{}, errors.New("ConnectionOptionsFromWorkflowServiceClient.WorkflowServiceClient is required")
+	}
+	if o.Namespace == "" {
+		return connection{}, errors.New("ConnectionOptionsFromWorkflowServiceClient.Namespace is required")
+	}
+	return connection{
+		service:   o.WorkflowServiceClient,
+		namespace: o.Namespace,
+		identity:  o.Identity,
+	}, nil
+}
+
+type handler struct {
+	service   workflowservice.WorkflowServiceClient
+	namespace string
+	identity  string
+	logger    *slog.Logger
+}
+
+// Handler serves the complete Standalone Nexus Operation API over HTTP and owns
+// the Temporal connection it dialed, if any. Close it to release that
+// connection.
+type Handler struct {
+	mux http.Handler
+	// close shuts down the dialed connection, and is nil when nothing was
+	// dialed.
+	close func()
+}
+
+// NewHandler returns a handler for the complete Standalone Nexus Operation API,
+// reaching Temporal as options.Connection selects. When that dials Temporal,
+// ctx bounds the connection attempt only; served requests use their own
+// contexts. Call [Handler.Close] when done with the handler to release the
+// connection it dialed, if any.
+func NewHandler(ctx context.Context, options Options) (*Handler, error) {
+	connectionOptions := options.Connection
+	if connectionOptions == nil {
+		connectionOptions = ConnectionOptionsFromClientOptions{}
+	}
+	c, err := connectionOptions.connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &Handler{mux: newHandler(c, options), close: c.close}, nil
+}
+
+// ServeHTTP implements [http.Handler].
+func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.mux.ServeHTTP(w, r)
+}
+
+// Close closes the Temporal connection [NewHandler] dialed, and does nothing
+// when nothing was dialed. It does not wait for in-flight HTTP requests; shut
+// down the HTTP server first.
+func (h *Handler) Close() {
+	if h.close != nil {
+		h.close()
+	}
+}
+
+// newHandler builds the routed HTTP handler around an already-established
+// connection.
+func newHandler(c connection, options Options) http.Handler {
+	h := &handler{
+		service:   c.service,
+		namespace: c.namespace,
+		identity:  c.identity,
 		logger:    cmp.Or(options.Logger, slog.Default()),
 	}
 	mux := http.NewServeMux()
@@ -242,10 +348,7 @@ func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.encodeStartRequest(r.Context(), request); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
+	materializeNullInput(request)
 	request.Namespace = h.namespace
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
@@ -329,12 +432,6 @@ func (h *handler) describeOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, errors.New("empty describe response from Temporal"))
 		return
 	}
-	info := response.GetInfo()
-	serializationContext := nexusSerializationContext(info.GetEndpoint(), info.GetService(), info.GetOperation())
-	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
-		h.writeError(w, fmt.Errorf("decode describe response: %w", err))
-		return
-	}
 	h.writeProto(w, query, http.StatusOK, response)
 }
 
@@ -355,17 +452,9 @@ func (h *handler) pollOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	// Servers without serialization context propagation omit the context, and
-	// the codecs then run without one.
-	propagated := response.GetPropagatedNexusSerializationContext()
-	serializationContext := nexusSerializationContext(propagated.GetEndpoint(), propagated.GetService(), propagated.GetOperation())
-	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
-		h.writeError(w, fmt.Errorf("decode poll response: %w", err))
-		return
-	}
 	if failure := response.GetFailure(); failure != nil {
-		// decodeInbound above decoded the failure in place, so it is converted
-		// as-is.
+		// The connection's codecs, if any, already decoded the failure, so it is
+		// converted as-is.
 		converted, convertErr := temporalFailureToNexusFailureInPlace(failure)
 		if convertErr != nil {
 			h.writeError(w, fmt.Errorf("convert operation failure: %w", convertErr))
@@ -399,10 +488,6 @@ func (h *handler) listOperations(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode list response: %w", err))
-		return
-	}
 	h.writeProto(w, query, http.StatusOK, response)
 }
 
@@ -414,10 +499,6 @@ func (h *handler) countOperations(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode count response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusOK, response)
@@ -439,17 +520,9 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
 	response, err := h.service.RequestCancelNexusOperationExecution(r.Context(), request)
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode cancel response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusAccepted, response)
@@ -471,17 +544,9 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
 	response, err := h.service.TerminateNexusOperationExecution(r.Context(), request)
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode terminate response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusOK, response)

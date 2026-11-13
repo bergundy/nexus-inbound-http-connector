@@ -98,10 +98,10 @@ func TestIntegrationStartOperation(t *testing.T) {
 
 	// The connector dials its own connection from client options, so this
 	// exercises NewHandler rather than the in-process test constructor.
-	handler, err := NewHandler(ctx, Options{ClientOptions: &client.Options{
+	handler, err := NewHandler(ctx, Options{Connection: ConnectionOptionsFromClientOptions{ClientOptions: &client.Options{
 		HostPort:  address,
 		Namespace: "default",
-	}})
+	}}})
 	require.NoError(t, err, "new handler")
 	t.Cleanup(handler.Close)
 
