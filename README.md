@@ -156,7 +156,7 @@ connector never calls, and is ignored: `DataConverter`, `FailureConverter`,
 the worker-only `WorkerHeartbeatInterval`, `SdkName`, and `SdkVersion`.
 `TEMPORAL_CODEC_ENDPOINT` and `TEMPORAL_CODEC_AUTH` are ignored for the same
 reason: they configure a remote data converter. Use
-[`PayloadCodecs`](#payload-codecs) for payload encoding.
+[`PayloadCodecs`](#payload-codecs) beside `ClientOptions` for payload encoding.
 
 ### Using an existing connection
 
@@ -181,8 +181,9 @@ address, TLS, credentials, and lifecycle. `WorkflowServiceClient` is required.
 `Namespace` is also required, since there is no dialed client whose default to
 follow, and is written to every request like `client.Options.Namespace`.
 `Identity` is used like `client.Options.Identity` and is left empty when
-unset. [Payload codecs](#payload-codecs) apply the same way as with a dialed
-connection.
+unset. Payload encoding is the client's too: install
+[the codec interceptor](#payload-codecs) on a connection the connector alone
+uses to encode payloads as a dialed connection does.
 
 ## Connector namespace
 
@@ -288,24 +289,45 @@ Add `?noPayloadShorthand` to use canonical protobuf JSON payloads instead. Add
 
 ### Payload codecs
 
-Codecs are applied inside the customer process at the raw WorkflowService
-payload boundary. They are optional, set on `Options` rather than on a
-connection, and apply the same way whichever `Connection` is used:
+Codecs are applied inside the customer process by a gRPC interceptor on the
+connection beneath the WorkflowService client, at the raw payload boundary. They
+are optional. With a dialed connection, set them beside `ClientOptions`:
 
 ```go
 handler, err := nexushttp.NewHandler(ctx, nexushttp.Options{
-	PayloadCodecs: []converter.PayloadCodec{myCodec},
+	Connection: nexushttp.ConnectionOptionsFromClientOptions{
+		PayloadCodecs: []converter.PayloadCodec{myCodec},
+	},
 })
 ```
 
-Without them, payloads are sent and returned unchanged.
+With an existing connection, install the same interceptor on it, since the
+connector applies no codecs to a client it did not dial:
+
+```go
+interceptor, err := nexushttp.NewPayloadCodecInterceptor([]converter.PayloadCodec{myCodec})
+// Pass grpc.WithChainUnaryInterceptor(interceptor) as the last interceptor when
+// dialing the connection whose WorkflowService client goes in
+// ConnectionOptionsFromWorkflowServiceClient.
+```
+
+Install it on a connection only the connector uses, or in place of the client's
+own codec, never beside it: an SDK client with a codec data converter already
+encodes its payloads, so every call on a shared connection would be encoded
+twice. Install it last, innermost, so other interceptors on the connection still
+see the SDK's typed errors.
+
+Without codecs, payloads are sent and returned unchanged. The interceptor
+encodes a copy of each request, so the caller's request is left as it was. Codec
+work runs inside each call, so the SDK's call metrics count it as latency and a
+codec error as a failed call.
 
 On start requests, codecs encode the parsed operation input before it is sent to
 Temporal. On describe and poll responses, they decode operation input, result,
 and failure payloads before those values are rendered as protobuf JSON or a
 Nexus Failure. Low-level WorkflowService calls bypass the client's data
-converter, so `PayloadCodecs` is the codec chain for these raw payloads, and
-`ClientOptions.DataConverter` is ignored.
+converter, so the interceptor's codecs are the codec chain for these raw
+payloads, and `ClientOptions.DataConverter` is ignored.
 
 Codecs that implement `converter.PayloadCodecWithSerializationContext` receive a
 `converter.NexusSerializationContext` with the operation's endpoint, service,

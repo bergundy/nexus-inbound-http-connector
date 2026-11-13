@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"slices"
 
 	"github.com/google/uuid"
 	"go.temporal.io/api/temporalproto"
@@ -20,6 +21,7 @@ import (
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/contrib/envconfig"
 	"go.temporal.io/sdk/converter"
+	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 )
@@ -84,13 +86,6 @@ type Options struct {
 	// Temporal environment configuration.
 	Connection ConnectionOptions
 
-	// PayloadCodecs are applied by the connector when reading and writing
-	// operation input, result, and failure payloads, whichever Connection is
-	// used. The connector calls the low-level WorkflowService directly, so no
-	// client data converter applies. Leave it empty to send and receive
-	// payloads unchanged.
-	PayloadCodecs []converter.PayloadCodec
-
 	// MaxRequestBodySize accepts a MaxRequestBodySize byte limit or
 	// MaxRequestBodySizeNotEnforced. It defaults to 4 MiB when unset. A
 	// MaxRequestBodySize of zero rejects non-empty request bodies.
@@ -153,10 +148,19 @@ type ConnectionOptionsFromClientOptions struct {
 	// the connector never calls, and is therefore ignored: DataConverter,
 	// FailureConverter, ContextPropagators, Interceptors, ExternalStorage,
 	// PayloadLimits, and the worker-only WorkerHeartbeatInterval, SdkName, and
-	// SdkVersion. Use [Options.PayloadCodecs] for payload encoding.
-	// TEMPORAL_CODEC_* environment configuration is ignored for the same
-	// reason: it only configures a remote data converter.
+	// SdkVersion. Use PayloadCodecs for payload encoding. TEMPORAL_CODEC_*
+	// environment configuration is ignored for the same reason: it only
+	// configures a remote data converter.
 	ClientOptions *client.Options
+
+	// PayloadCodecs are applied to the payloads of every call on the dialed
+	// connection, by the interceptor [NewPayloadCodecInterceptor] returns,
+	// installed innermost: after the SDK's own interceptors and any of
+	// ClientOptions' dial options. MetricsHandler therefore counts codec work as
+	// call latency, and a codec error as a failed call. The connector calls the
+	// low-level WorkflowService directly, so no client data converter applies.
+	// Leave it empty to send and receive payloads unchanged.
+	PayloadCodecs []converter.PayloadCodec
 }
 
 func (o ConnectionOptionsFromClientOptions) connect(ctx context.Context) (connection, error) {
@@ -165,6 +169,17 @@ func (o ConnectionOptionsFromClientOptions) connect(ctx context.Context) (connec
 		return connection{}, err
 	}
 	clientOptions.HeadersProvider = identityHeadersProvider{next: clientOptions.HeadersProvider}
+	if len(o.PayloadCodecs) > 0 {
+		codecs, err := NewPayloadCodecInterceptor(o.PayloadCodecs)
+		if err != nil {
+			return connection{}, fmt.Errorf("build payload codec interceptor: %w", err)
+		}
+		// Clipped so the append never writes into the caller's slice.
+		clientOptions.ConnectionOptions.DialOptions = append(
+			slices.Clip(clientOptions.ConnectionOptions.DialOptions),
+			grpc.WithChainUnaryInterceptor(codecs),
+		)
+	}
 	temporalClient, err := client.DialContext(ctx, clientOptions)
 	if err != nil {
 		return connection{}, fmt.Errorf("dial Temporal: %w", err)
@@ -204,6 +219,10 @@ func (o ConnectionOptionsFromClientOptions) connection(service workflowservice.W
 // connection. NewHandler dials nothing and loads no environment configuration,
 // and [Handler.Close] does nothing: the caller owns the client, including its
 // address, TLS, credentials, and lifecycle.
+//
+// Payload encoding is the client's too: the connector applies no codecs to its
+// calls. Install the interceptor [NewPayloadCodecInterceptor] returns on the
+// client's connection to encode payloads as a dialed connection would.
 type ConnectionOptionsFromWorkflowServiceClient struct {
 	// WorkflowServiceClient is used for every Temporal call. It is required
 	// and must be ready to use.
@@ -236,7 +255,6 @@ type handler struct {
 	service   workflowservice.WorkflowServiceClient
 	namespace string
 	identity  string
-	codecs    []converter.PayloadCodec
 	logger    *slog.Logger
 }
 
@@ -288,7 +306,6 @@ func newHandler(c connection, options Options) http.Handler {
 		service:   c.service,
 		namespace: c.namespace,
 		identity:  c.identity,
-		codecs:    append([]converter.PayloadCodec(nil), options.PayloadCodecs...),
 		logger:    cmp.Or(options.Logger, slog.Default()),
 	}
 	mux := http.NewServeMux()
@@ -331,10 +348,7 @@ func (h *handler) startOperation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.encodeStartRequest(r.Context(), request); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
+	materializeNullInput(request)
 	request.Namespace = h.namespace
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
@@ -418,12 +432,6 @@ func (h *handler) describeOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, errors.New("empty describe response from Temporal"))
 		return
 	}
-	info := response.GetInfo()
-	serializationContext := nexusSerializationContext(info.GetEndpoint(), info.GetService(), info.GetOperation())
-	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
-		h.writeError(w, fmt.Errorf("decode describe response: %w", err))
-		return
-	}
 	h.writeProto(w, query, http.StatusOK, response)
 }
 
@@ -444,17 +452,9 @@ func (h *handler) pollOperation(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	// Servers without serialization context propagation omit the context, and
-	// the codecs then run without one.
-	propagated := response.GetPropagatedNexusSerializationContext()
-	serializationContext := nexusSerializationContext(propagated.GetEndpoint(), propagated.GetService(), propagated.GetOperation())
-	if err := h.decodeInbound(r.Context(), response, serializationContext); err != nil {
-		h.writeError(w, fmt.Errorf("decode poll response: %w", err))
-		return
-	}
 	if failure := response.GetFailure(); failure != nil {
-		// decodeInbound above decoded the failure in place, so it is converted
-		// as-is.
+		// The connection's codecs, if any, already decoded the failure, so it is
+		// converted as-is.
 		converted, convertErr := temporalFailureToNexusFailureInPlace(failure)
 		if convertErr != nil {
 			h.writeError(w, fmt.Errorf("convert operation failure: %w", convertErr))
@@ -488,10 +488,6 @@ func (h *handler) listOperations(w http.ResponseWriter, r *http.Request) {
 		h.writeError(w, err)
 		return
 	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode list response: %w", err))
-		return
-	}
 	h.writeProto(w, query, http.StatusOK, response)
 }
 
@@ -503,10 +499,6 @@ func (h *handler) countOperations(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode count response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusOK, response)
@@ -528,17 +520,9 @@ func (h *handler) cancelOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
 	response, err := h.service.RequestCancelNexusOperationExecution(r.Context(), request)
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode cancel response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusAccepted, response)
@@ -560,17 +544,9 @@ func (h *handler) terminateOperation(w http.ResponseWriter, r *http.Request) {
 	request.RunId = cmp.Or(request.RunId, query.optString("runId"))
 	request.Identity = cmp.Or(request.Identity, h.identity)
 	request.RequestId = requestIDFromHeader(r)
-	if err := h.encodeOutbound(r.Context(), request, nil); err != nil {
-		h.writeError(w, fmt.Errorf("encode request payloads: %w", err))
-		return
-	}
 	response, err := h.service.TerminateNexusOperationExecution(r.Context(), request)
 	if err != nil {
 		h.writeError(w, err)
-		return
-	}
-	if err := h.decodeInbound(r.Context(), response, nil); err != nil {
-		h.writeError(w, fmt.Errorf("decode terminate response: %w", err))
 		return
 	}
 	h.writeProto(w, query, http.StatusOK, response)

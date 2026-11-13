@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"go.temporal.io/sdk/temporal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -163,31 +165,146 @@ func TestNewHandlerUsesSuppliedWorkflowServiceClient(t *testing.T) {
 	h.Close()
 }
 
-// TestSuppliedWorkflowServiceClientAppliesPayloadCodecs pins that payload codecs
-// apply the same way with a supplied WorkflowService client as with a dialed
-// one.
-func TestSuppliedWorkflowServiceClientAppliesPayloadCodecs(t *testing.T) {
+// TestSuppliedWorkflowServiceClientEncodesWithTheInterceptor pins that a
+// caller who installs NewPayloadCodecInterceptor on its own connection gets the
+// payload encoding a dialed connection applies.
+func TestSuppliedWorkflowServiceClientEncodesWithTheInterceptor(t *testing.T) {
 	t.Parallel()
 
 	codec := &prefixCodec{}
+	interceptor, err := NewPayloadCodecInterceptor([]converter.PayloadCodec{codec})
+	require.NoError(t, err)
+	var gotRequest *workflowservice.StartNexusOperationExecutionRequest
+	conn, err := grpc.NewClient(
+		startFakeServer(t, &fakeWorkflowService{
+			start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+				gotRequest = request
+				return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
+			},
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithChainUnaryInterceptor(interceptor),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
 	h, err := NewHandler(t.Context(), Options{
 		Connection: ConnectionOptionsFromWorkflowServiceClient{
-			WorkflowServiceClient: &fakeWorkflowService{
-				start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
-					require.Equal(t, "encoded/test", string(request.Input.Metadata[converter.MetadataEncoding]))
-					require.Equal(t, `prefix:{"value":1}`, string(request.Input.Data))
-					return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
-				},
-			},
-			Namespace: "embedded-namespace",
+			WorkflowServiceClient: workflowservice.NewWorkflowServiceClient(conn),
+			Namespace:             "embedded-namespace",
 		},
-		PayloadCodecs: []converter.PayloadCodec{codec},
 	})
 	require.NoError(t, err)
 
 	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"value":1}}`)
 	requireStatus(t, http.StatusCreated, response)
 	require.Equal(t, 1, codec.encoded)
+	require.Equal(t, "encoded/test", string(gotRequest.Input.Metadata[converter.MetadataEncoding]))
+	require.Equal(t, `prefix:{"value":1}`, string(gotRequest.Input.Data))
+}
+
+// TestPayloadCodecFailuresAreInternalErrors pins that a codec failing in either
+// direction answers 500 without the codec's error, which is logged under the
+// RPC it failed for.
+func TestPayloadCodecFailuresAreInternalErrors(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]struct {
+		codec  failingCodec
+		method string
+		target string
+		body   string
+		logged string
+	}{
+		"encode": {
+			codec:  failingCodec{encode: true},
+			method: http.MethodPost,
+			target: "/operations/op",
+			body:   `{"endpoint":"e","service":"s","operation":"o","input":1}`,
+			logged: "encode StartNexusOperationExecution payloads: codec broke",
+		},
+		"decode": {
+			codec:  failingCodec{decode: true},
+			method: http.MethodGet,
+			target: "/operations/op?includeInput=true",
+			logged: "decode DescribeNexusOperationExecution payloads: codec broke",
+		},
+	}
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			var logs bytes.Buffer
+			h, err := NewHandler(t.Context(), Options{
+				Connection: ConnectionOptionsFromClientOptions{
+					ClientOptions: &client.Options{
+						HostPort: startFakeServer(t, &fakeWorkflowService{
+							start: func(context.Context, *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+								return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
+							},
+							describe: func(context.Context, *workflowservice.DescribeNexusOperationExecutionRequest) (*workflowservice.DescribeNexusOperationExecutionResponse, error) {
+								return &workflowservice.DescribeNexusOperationExecutionResponse{Input: jsonPayload(`"in"`)}, nil
+							},
+						}),
+						Namespace: "test-namespace",
+					},
+					PayloadCodecs: []converter.PayloadCodec{test.codec},
+				},
+				Logger: slog.New(slog.NewTextHandler(&logs, nil)),
+			})
+			require.NoError(t, err)
+			t.Cleanup(h.Close)
+
+			response := serve(h, test.method, test.target, test.body)
+			requireStatus(t, http.StatusInternalServerError, response)
+			require.NotContains(t, response.Body.String(), "codec broke", "body leaked the codec error")
+			require.Contains(t, logs.String(), test.logged)
+		})
+	}
+}
+
+// TestPayloadCodecInterceptorEncodesACopy pins that the interceptor leaves the
+// caller's request as it was, so an interceptor outside it that sends the same
+// request again, such as the SDK's gzip fallback, does not encode it twice.
+func TestPayloadCodecInterceptorEncodesACopy(t *testing.T) {
+	t.Parallel()
+
+	interceptor, err := NewPayloadCodecInterceptor([]converter.PayloadCodec{&prefixCodec{}})
+	require.NoError(t, err)
+	request := &workflowservice.StartNexusOperationExecutionRequest{Input: jsonPayload(`{"value":1}`)}
+	var sent []string
+	invoker := func(_ context.Context, _ string, req, _ any, _ *grpc.ClientConn, _ ...grpc.CallOption) error {
+		sent = append(sent, string(req.(*workflowservice.StartNexusOperationExecutionRequest).Input.Data))
+		return nil
+	}
+	reply := &workflowservice.StartNexusOperationExecutionResponse{}
+	for range 2 {
+		require.NoError(t, interceptor(t.Context(), "/start", request, reply, nil, invoker))
+	}
+
+	require.Equal(t, []string{`prefix:{"value":1}`, `prefix:{"value":1}`}, sent)
+	require.Equal(t, `{"value":1}`, string(request.Input.Data), "the caller's request must not be encoded")
+}
+
+// TestPayloadCodecsLeaveCallerDialOptionsAlone pins that installing the codec
+// interceptor does not write into the caller's DialOptions.
+func TestPayloadCodecsLeaveCallerDialOptionsAlone(t *testing.T) {
+	t.Parallel()
+
+	dialOptions := make([]grpc.DialOption, 0, 4)
+	clientOptions := &client.Options{
+		HostPort:          startFakeServer(t, &fakeWorkflowService{}),
+		ConnectionOptions: client.ConnectionOptions{DialOptions: dialOptions},
+	}
+	h, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromClientOptions{
+		ClientOptions: clientOptions,
+		PayloadCodecs: []converter.PayloadCodec{&prefixCodec{}},
+	}})
+	require.NoError(t, err)
+	t.Cleanup(h.Close)
+
+	require.Empty(t, clientOptions.ConnectionOptions.DialOptions)
+	require.Nil(t, dialOptions[:1][0], "nothing written into the caller's backing array")
 }
 
 // TestSuppliedWorkflowServiceClientLeavesIdentityEmpty pins that an unset
@@ -382,15 +499,17 @@ func TestStartOperationCodec(t *testing.T) {
 	t.Parallel()
 
 	codec := &prefixCodec{}
+	var gotRequest *workflowservice.StartNexusOperationExecutionRequest
 	service := &fakeWorkflowService{start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
-		require.NotEmpty(t, request.RequestId, "request ID must be generated")
-		require.Equal(t, "encoded/test", string(request.Input.Metadata[converter.MetadataEncoding]))
-		require.Equal(t, `prefix:{"value":1}`, string(request.Input.Data))
+		gotRequest = request
 		return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
 	}}
-	h := newTestHandler(t, service, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	h := newCodecTestHandler(t, service, codec)
 	response := serve(h, http.MethodPost, "/operations/op", `{"endpoint":"e","service":"s","operation":"o","input":{"value":1}}`)
 	requireStatus(t, http.StatusCreated, response)
+	require.NotEmpty(t, gotRequest.RequestId, "request ID must be generated")
+	require.Equal(t, "encoded/test", string(gotRequest.Input.Metadata[converter.MetadataEncoding]))
+	require.Equal(t, `prefix:{"value":1}`, string(gotRequest.Input.Data))
 	require.Equal(t, 1, codec.encoded)
 	require.Equal(t, 0, codec.decoded)
 }
@@ -403,12 +522,12 @@ func TestStartOperationCodecSkipsSearchAttributes(t *testing.T) {
 
 	codec := &prefixCodec{}
 	var gotRequest *workflowservice.StartNexusOperationExecutionRequest
-	h := newTestHandler(t, &fakeWorkflowService{
+	h := newCodecTestHandler(t, &fakeWorkflowService{
 		start: func(_ context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
 			gotRequest = request
 			return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
 		},
-	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	}, codec)
 
 	response := serve(h, http.MethodPost, "/operations/op", `{
 		"endpoint":"e","service":"s","operation":"o",
@@ -435,11 +554,11 @@ func TestStartOperationCodecSerializationContext(t *testing.T) {
 	t.Parallel()
 
 	codec := &contextRecordingCodec{}
-	h := newTestHandler(t, &fakeWorkflowService{
+	h := newCodecTestHandler(t, &fakeWorkflowService{
 		start: func(context.Context, *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
 			return &workflowservice.StartNexusOperationExecutionResponse{RunId: "run-1"}, nil
 		},
-	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	}, codec)
 
 	response := serve(h, http.MethodPost, "/operations/op", `{
 		"endpoint":"e","service":"s","operation":"o",
@@ -458,7 +577,7 @@ func TestDescribeOperationCodecSerializationContext(t *testing.T) {
 	t.Parallel()
 
 	codec := &contextRecordingCodec{}
-	h := newTestHandler(t, &fakeWorkflowService{
+	h := newCodecTestHandler(t, &fakeWorkflowService{
 		describe: func(context.Context, *workflowservice.DescribeNexusOperationExecutionRequest) (*workflowservice.DescribeNexusOperationExecutionResponse, error) {
 			return &workflowservice.DescribeNexusOperationExecutionResponse{
 				Info: &nexuspb.NexusOperationExecutionInfo{
@@ -479,7 +598,7 @@ func TestDescribeOperationCodecSerializationContext(t *testing.T) {
 				}},
 			}, nil
 		},
-	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	}, codec)
 
 	response := serve(h, http.MethodGet, "/operations/op?includeInput=true&includeOutcome=true", "")
 	requireStatus(t, http.StatusOK, response)
@@ -511,7 +630,7 @@ func TestPollOperationCodecSerializationContext(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
 			codec := &contextRecordingCodec{}
-			h := newTestHandler(t, &fakeWorkflowService{
+			h := newCodecTestHandler(t, &fakeWorkflowService{
 				poll: func(context.Context, *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
 					return &workflowservice.PollNexusOperationExecutionResponse{
 						WaitStage:                           enumspb.NEXUS_OPERATION_WAIT_STAGE_CLOSED,
@@ -519,7 +638,7 @@ func TestPollOperationCodecSerializationContext(t *testing.T) {
 						Outcome:                             &workflowservice.PollNexusOperationExecutionResponse_Result{Result: jsonPayload(`"out"`)},
 					}, nil
 				},
-			}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+			}, codec)
 
 			response := serve(h, http.MethodGet, "/operations/op/poll", "")
 			requireStatus(t, http.StatusOK, response)
@@ -546,7 +665,7 @@ func TestPayloadShorthandNullRoundTrip(t *testing.T) {
 	query := newRequestQuery(request)
 	message := &workflowservice.StartNexusOperationExecutionRequest{}
 	require.NoError(t, decodeProtoBody(request.Body, query, message, false), "decode null input")
-	require.NoError(t, newBareHandler().encodeStartRequest(t.Context(), message), "encode null input")
+	materializeNullInput(message)
 	payload := message.Input
 	require.Equal(t, converter.MetadataEncodingNil, string(payload.Metadata[converter.MetadataEncoding]))
 
@@ -645,7 +764,7 @@ func TestReadAndActionRoutesUseProtoResponses(t *testing.T) {
 			return &workflowservice.TerminateNexusOperationExecutionResponse{}, nil
 		},
 	}
-	h := newTestHandler(t, service, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	h := newCodecTestHandler(t, service, codec)
 
 	tests := []struct {
 		method    string
@@ -848,11 +967,11 @@ func TestPollOperationFailurePreservesTemporalFailure(t *testing.T) {
 		}),
 	})
 	decodingCodec := &prefixCodec{}
-	h := newTestHandler(t, &fakeWorkflowService{
+	h := newCodecTestHandler(t, &fakeWorkflowService{
 		poll: func(context.Context, *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
 			return &workflowservice.PollNexusOperationExecutionResponse{Outcome: &workflowservice.PollNexusOperationExecutionResponse_Failure{Failure: protoFailure}}, nil
 		},
-	}, Options{PayloadCodecs: []converter.PayloadCodec{decodingCodec}})
+	}, decodingCodec)
 
 	response := serve(h, http.MethodGet, "/operations/op/poll", "")
 	requireStatus(t, http.StatusFailedDependency, response)
@@ -885,7 +1004,7 @@ func TestPollOperationFailurePreservesTemporalFailure(t *testing.T) {
 func TestPollOperationStartedStageHasNoOutcome(t *testing.T) {
 	t.Parallel()
 	codec := &prefixCodec{}
-	h := newTestHandler(t, &fakeWorkflowService{
+	h := newCodecTestHandler(t, &fakeWorkflowService{
 		poll: func(context.Context, *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
 			return &workflowservice.PollNexusOperationExecutionResponse{
 				RunId:          "run-1",
@@ -893,7 +1012,7 @@ func TestPollOperationStartedStageHasNoOutcome(t *testing.T) {
 				OperationToken: "operation-token",
 			}, nil
 		},
-	}, Options{PayloadCodecs: []converter.PayloadCodec{codec}})
+	}, codec)
 
 	response := serve(h, http.MethodGet, "/operations/op/poll", "")
 	requireStatus(t, http.StatusOK, response)
@@ -973,10 +1092,71 @@ func newTestHandler(t *testing.T, service workflowservice.WorkflowServiceClient,
 	return newHandler(connectionOptions.connection(service, clientOptions), options)
 }
 
+// newCodecTestHandler builds a handler that dials a gRPC server serving
+// service with codecs installed on the connection, as NewHandler does in
+// production. The handler's namespace is "test-namespace".
+func newCodecTestHandler(t *testing.T, service *fakeWorkflowService, codecs ...converter.PayloadCodec) http.Handler {
+	t.Helper()
+	h, err := NewHandler(t.Context(), Options{Connection: ConnectionOptionsFromClientOptions{
+		ClientOptions: &client.Options{HostPort: startFakeServer(t, service), Namespace: "test-namespace"},
+		PayloadCodecs: codecs,
+	}})
+	require.NoError(t, err)
+	t.Cleanup(h.Close)
+	return h
+}
+
+// startFakeServer serves service over gRPC on a loopback port, stopped when the
+// test ends, and returns its address.
+func startFakeServer(t *testing.T, service *fakeWorkflowService) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	workflowservice.RegisterWorkflowServiceServer(server, fakeServer{service: service})
+	go func() { _ = server.Serve(listener) }()
+	t.Cleanup(server.Stop)
+	return listener.Addr().String()
+}
+
+// fakeServer serves a fakeWorkflowService over gRPC.
+type fakeServer struct {
+	workflowservice.UnimplementedWorkflowServiceServer
+	service *fakeWorkflowService
+}
+
+func (s fakeServer) StartNexusOperationExecution(ctx context.Context, request *workflowservice.StartNexusOperationExecutionRequest) (*workflowservice.StartNexusOperationExecutionResponse, error) {
+	return s.service.StartNexusOperationExecution(ctx, request)
+}
+
+func (s fakeServer) DescribeNexusOperationExecution(ctx context.Context, request *workflowservice.DescribeNexusOperationExecutionRequest) (*workflowservice.DescribeNexusOperationExecutionResponse, error) {
+	return s.service.DescribeNexusOperationExecution(ctx, request)
+}
+
+func (s fakeServer) PollNexusOperationExecution(ctx context.Context, request *workflowservice.PollNexusOperationExecutionRequest) (*workflowservice.PollNexusOperationExecutionResponse, error) {
+	return s.service.PollNexusOperationExecution(ctx, request)
+}
+
+func (s fakeServer) ListNexusOperationExecutions(ctx context.Context, request *workflowservice.ListNexusOperationExecutionsRequest) (*workflowservice.ListNexusOperationExecutionsResponse, error) {
+	return s.service.ListNexusOperationExecutions(ctx, request)
+}
+
+func (s fakeServer) CountNexusOperationExecutions(ctx context.Context, request *workflowservice.CountNexusOperationExecutionsRequest) (*workflowservice.CountNexusOperationExecutionsResponse, error) {
+	return s.service.CountNexusOperationExecutions(ctx, request)
+}
+
+func (s fakeServer) RequestCancelNexusOperationExecution(ctx context.Context, request *workflowservice.RequestCancelNexusOperationExecutionRequest) (*workflowservice.RequestCancelNexusOperationExecutionResponse, error) {
+	return s.service.RequestCancelNexusOperationExecution(ctx, request)
+}
+
+func (s fakeServer) TerminateNexusOperationExecution(ctx context.Context, request *workflowservice.TerminateNexusOperationExecutionRequest) (*workflowservice.TerminateNexusOperationExecutionResponse, error) {
+	return s.service.TerminateNexusOperationExecution(ctx, request)
+}
+
 // newBareHandler builds a handler without routing, for tests that exercise a
 // single helper rather than the HTTP API.
-func newBareHandler(codecs ...converter.PayloadCodec) *handler {
-	return &handler{logger: slog.New(slog.DiscardHandler), codecs: codecs}
+func newBareHandler() *handler {
+	return &handler{logger: slog.New(slog.DiscardHandler)}
 }
 
 func serve(h http.Handler, method, target, body string) *httptest.ResponseRecorder {
@@ -1068,6 +1248,27 @@ func (c *prefixCodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload,
 }
 
 var _ converter.PayloadCodec = (*prefixCodec)(nil)
+
+// failingCodec fails to encode, to decode, or both, and otherwise passes
+// payloads through.
+type failingCodec struct {
+	encode bool
+	decode bool
+}
+
+func (c failingCodec) Encode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+	if c.encode {
+		return nil, errors.New("codec broke")
+	}
+	return payloads, nil
+}
+
+func (c failingCodec) Decode(payloads []*commonpb.Payload) ([]*commonpb.Payload, error) {
+	if c.decode {
+		return nil, errors.New("codec broke")
+	}
+	return payloads, nil
+}
 
 // contextRecordingCodec passes payloads through unchanged and records, for
 // each one, the serialization context it was given.
