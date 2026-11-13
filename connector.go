@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -23,6 +24,39 @@ import (
 )
 
 const defaultMaxRequestBodySize int64 = 4 << 20
+
+const (
+	// clientName and clientVersion identify the connector to Temporal in place
+	// of the Go SDK's "temporal-go" identity, which the SDK only attaches to
+	// its own high-level calls and never to the WorkflowService stub.
+	clientName    = "temporal-nexus-inbound-http-connector"
+	clientVersion = "0.1.0"
+
+	clientNameHeader    = "client-name"
+	clientVersionHeader = "client-version"
+)
+
+// identityHeadersProvider adds the connector's client name and version to every
+// request, after any headers from the wrapped provider.
+type identityHeadersProvider struct {
+	next interface {
+		GetHeaders(context.Context) (map[string]string, error)
+	}
+}
+
+func (p identityHeadersProvider) GetHeaders(ctx context.Context) (map[string]string, error) {
+	headers := map[string]string{}
+	if p.next != nil {
+		next, err := p.next.GetHeaders(ctx)
+		if err != nil {
+			return nil, err
+		}
+		maps.Copy(headers, next)
+	}
+	headers[clientNameHeader] = clientName
+	headers[clientVersionHeader] = clientVersion
+	return headers, nil
+}
 
 // RequestBodySizeLimit is a closed set of request body size configurations.
 type RequestBodySizeLimit interface {
@@ -50,7 +84,9 @@ type Options struct {
 	// WorkflowService, so only part of this struct reaches its requests:
 	//
 	//   - HostPort, Credentials, ConnectionOptions, and HeadersProvider open the
-	//     connection and authenticate every call the connector makes. HostPort
+	//     connection and authenticate every call the connector makes. The connector adds its own
+	//     client-name and client-version headers to HeadersProvider's, replacing
+	//     any of the same name. HostPort
 	//     defaults to [client.DefaultHostPort].
 	//   - Namespace is written to every WorkflowService request. It defaults to
 	//     [client.DefaultNamespace], matching the SDK client's own default.
@@ -121,6 +157,7 @@ func NewHandler(ctx context.Context, options Options) (*Handler, error) {
 	if err != nil {
 		return nil, err
 	}
+	clientOptions.HeadersProvider = identityHeadersProvider{next: clientOptions.HeadersProvider}
 	temporalClient, err := client.DialContext(ctx, clientOptions)
 	if err != nil {
 		return nil, fmt.Errorf("dial Temporal: %w", err)

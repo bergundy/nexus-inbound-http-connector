@@ -973,3 +973,17 @@ func jsonPayload(data string) *commonpb.Payload {
 		Data:     []byte(data),
 	}
 }
+
+type staticHeaders map[string]string
+
+func (h staticHeaders) GetHeaders(context.Context) (map[string]string, error) { return h, nil }
+
+func TestIdentityHeadersProvider(t *testing.T) {
+	headers, err := identityHeadersProvider{next: staticHeaders{"x-a": "b", clientNameHeader: "other"}}.GetHeaders(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{"x-a": "b", clientNameHeader: clientName, clientVersionHeader: clientVersion}, headers)
+
+	headers, err = identityHeadersProvider{}.GetHeaders(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{clientNameHeader: clientName, clientVersionHeader: clientVersion}, headers)
+}
